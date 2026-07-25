@@ -1,12 +1,12 @@
 [package]
-name = "touch-ui"
+name = "touchbard"
 version = "0.1.0"
 edition = "2021"
-description = "Core integration layer for Touch UI framework: Dioxus -> Blitz -> AnyRender -> Vello CPU"
+description = "Core integration layer for Touchbard framework: Dioxus -> Blitz -> AnyRender -> Vello CPU"
 
 [dependencies]
-touch-ui-macros = { path = "../touch-ui-macros" }
-touch-ui-renderer = { path = "../touch-ui-renderer" }
+touchbard-macros = { path = "../touchbard-macros" }
+touchbard-renderer = { path = "../touchbard-renderer" }
 dioxus = { workspace = true }
 dioxus-core = { workspace = true }
 dioxus-html = { workspace = true }

@@ -107,7 +107,7 @@ pub fn hello(hello: &Hello) -> Message {
 /// [9..]    premultiplied RGBA8 pixel data (length = width * height * 4)
 /// ```
 ///
-/// Pixel bytes are the canonical [`Frame`](touch_ui_renderer::Frame) format
+/// Pixel bytes are the canonical [`Frame`](touchbard_renderer::Frame) format
 /// (premultiplied alpha). The browser client un-premultiplies them at the
 /// backend boundary because `canvas.putImageData` requires straight alpha.
 pub fn frame(width: u32, height: u32, pixels: &[u8]) -> Message {

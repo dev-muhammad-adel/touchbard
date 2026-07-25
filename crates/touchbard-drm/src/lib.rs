@@ -1,4 +1,4 @@
-//! DRM/KMS backend for the Touch UI framework.
+//! DRM/KMS backend for the Touchbard framework.
 //!
 //! Placeholder: real DRM work (connector discovery, modesetting, page flips,
 //! GBM/EGL allocator) is a later milestone and is deliberately not implemented
@@ -17,13 +17,13 @@
 use std::cell::RefCell;
 use std::rc::Rc;
 
-use touch_ui_renderer::{Backend, FrameSource, Viewport};
+use touchbard_renderer::{Backend, FrameSource, Viewport};
 
 /// Configuration for the DRM backend.
 ///
 /// Minimal by design: there are no tunables yet. When real DRM lands, fields
 /// such as a `--drm=<card>` device path can be added here while the preview
-/// fields remain in the touch-ui-preview crate's `PreviewConfig`.
+/// fields remain in the touchbard-preview crate's `PreviewConfig`.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct DrmConfig;
 

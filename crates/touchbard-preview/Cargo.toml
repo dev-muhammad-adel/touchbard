@@ -1,11 +1,11 @@
 [package]
-name = "touch-ui-preview"
+name = "touchbard-preview"
 version = "0.1.0"
 edition = "2021"
-description = "WebSocket preview backend for Touch UI: render framebuffer to a browser canvas"
+description = "WebSocket preview backend for Touchbard: render framebuffer to a browser canvas"
 
 [dependencies]
-touch-ui-renderer = { path = "../touch-ui-renderer" }
+touchbard-renderer = { path = "../touchbard-renderer" }
 tokio = { workspace = true }
 tokio-tungstenite = { workspace = true }
 futures-util = { workspace = true }

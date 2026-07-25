@@ -16,7 +16,7 @@
 //! current-thread Tokio runtime + `LocalSet`.
 
 use crate::protocol::{self, Hello};
-use touch_ui_renderer::{
+use touchbard_renderer::{
     Backend, FrameSource, PointerButton, PointerEvent, PointerEventKind, Viewport,
 };
 
@@ -61,27 +61,27 @@ pub struct PreviewConfig {
 }
 
 impl PreviewConfig {
-    /// Read overrides from `TOUCH_UI_WIDTH`, `TOUCH_UI_HEIGHT`, `TOUCH_UI_SCALE`
-    /// (physical pixels / scale factor) and `TOUCH_UI_BIND` (server address);
+    /// Read overrides from `TOUCHBARD_WIDTH`, `TOUCHBARD_HEIGHT`, `TOUCHBARD_SCALE`
+    /// (physical pixels / scale factor) and `TOUCHBARD_BIND` (server address);
     /// invalid values fall back to defaults.
     pub fn from_env() -> Self {
         let mut config = Self::default();
-        if let Ok(value) = std::env::var("TOUCH_UI_WIDTH") {
+        if let Ok(value) = std::env::var("TOUCHBARD_WIDTH") {
             if let Ok(width) = value.parse() {
                 config.width = width;
             }
         }
-        if let Ok(value) = std::env::var("TOUCH_UI_HEIGHT") {
+        if let Ok(value) = std::env::var("TOUCHBARD_HEIGHT") {
             if let Ok(height) = value.parse() {
                 config.height = height;
             }
         }
-        if let Ok(value) = std::env::var("TOUCH_UI_SCALE") {
+        if let Ok(value) = std::env::var("TOUCHBARD_SCALE") {
             if let Ok(scale) = value.parse() {
                 config.scale_factor = scale;
             }
         }
-        if let Ok(value) = std::env::var("TOUCH_UI_BIND") {
+        if let Ok(value) = std::env::var("TOUCHBARD_BIND") {
             if !value.trim().is_empty() {
                 config.bind_addr = value.trim().to_string();
             }

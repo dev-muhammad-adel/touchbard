@@ -4,7 +4,7 @@
 //! stored under the `chapter` parameter.
 
 use dioxus::prelude::*;
-use touch_ui::routing::use_route_param;
+use touchbard::routing::use_route_param;
 
 #[component]
 pub fn Page() -> Element {

@@ -1,8 +1,8 @@
 [package]
-name = "touch-ui-renderer"
+name = "touchbard-renderer"
 version = "0.1.0"
 edition = "2021"
-description = "Rendering backends and shared boundary types for Touch UI: CPU framebuffer rendering"
+description = "Rendering backends and shared boundary types for Touchbard: CPU framebuffer rendering"
 
 [dependencies]
 anyrender = { workspace = true }

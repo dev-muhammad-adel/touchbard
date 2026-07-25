@@ -1,4 +1,4 @@
-//! Rendering backends and shared boundary types for Touch UI.
+//! Rendering backends and shared boundary types for Touchbard.
 //!
 //! This crate owns:
 //! - the concrete CPU rendering pipeline ([`cpu`]) used by all display backends,
@@ -9,8 +9,8 @@
 //!   creates the UI at,
 //! - the [`FrameSource`] trait backends use to drive a runtime without knowing
 //!   about Dioxus or Blitz,
-//! - the [`Backend`] trait that concrete backends (`touch-ui-preview`,
-//!   `touch-ui-drm`) implement, so the core crate is independent of them.
+//! - the [`Backend`] trait that concrete backends (`touchbard-preview`,
+//!   `touchbard-drm`) implement, so the core crate is independent of them.
 
 pub mod backend;
 pub mod cpu;

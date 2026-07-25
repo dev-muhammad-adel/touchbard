@@ -1,4 +1,4 @@
-//! Core `TouchUiSystem`: owns the Dioxus+Blitz document and renders frames.
+//! Core `TouchbardSystem`: owns the Dioxus+Blitz document and renders frames.
 
 use blitz_dom::Document as _;
 use blitz_paint::paint_scene;
@@ -6,37 +6,37 @@ use blitz_traits::events::UiEvent;
 use blitz_traits::shell::{ColorScheme, Viewport as BlitzViewport};
 use dioxus_core::VirtualDom;
 use dioxus_native_dom::{DioxusDocument, DocumentConfig};
-use touch_ui_renderer::{CpuRenderer, Frame, FrameSource, PointerEvent, PointerEventKind};
+use touchbard_renderer::{CpuRenderer, Frame, FrameSource, PointerEvent, PointerEventKind};
 use tracing::trace;
 
-/// Viewport (framebuffer) configuration for a [`TouchUiSystem`].
+/// Viewport (framebuffer) configuration for a [`TouchbardSystem`].
 ///
 /// This is the authoritative physical-pixel framebuffer size plus a scale
 /// factor, produced by the selected backend at initialization (the preview's
 /// `PreviewConfig` defaults/env today, future DRM connector discovery later).
 /// The runtime creates the system at exactly this viewport; there is no
 /// independent copy anywhere else.
-pub use touch_ui_renderer::Viewport;
+pub use touchbard_renderer::Viewport;
 
 /// The central runtime: a Dioxus `VirtualDom` integrated with a Blitz
 /// `BaseDocument`, plus a CPU (Vello) render pipeline.
 ///
 /// Operations:
-///  1. [`TouchUiSystem::new`] creates the document from a Dioxus app function.
-///  2. [`TouchUiSystem::poll`] flushes Dioxus mutations into Blitz.
-///  3. [`TouchUiSystem::render`] rasterizes the Blitz document into an RGBA
-///     [`Frame`] via AnyRender + Vello CPU (through `touch-ui-renderer`).
+///  1. [`TouchbardSystem::new`] creates the document from a Dioxus app function.
+///  2. [`TouchbardSystem::poll`] flushes Dioxus mutations into Blitz.
+///  3. [`TouchbardSystem::render`] rasterizes the Blitz document into an RGBA
+///     [`Frame`] via AnyRender + Vello CPU (through `touchbard-renderer`).
 ///
-/// Input arrives via [`TouchUiSystem::handle_pointer_event`] (converted to
+/// Input arrives via [`TouchbardSystem::handle_pointer_event`] (converted to
 /// Blitz `UiEvent`s) and is dispatched into the Dioxus runtime.
-pub struct TouchUiSystem {
+pub struct TouchbardSystem {
     /// The document, exposed so render backends and the shell can drive it.
     pub document: DioxusDocument,
     renderer: CpuRenderer,
     config: Viewport,
 }
 
-impl TouchUiSystem {
+impl TouchbardSystem {
     /// Create a new system from a Dioxus app function.
     pub fn new(app: fn() -> dioxus_core::Element, config: Viewport) -> Self {
         let vdom = VirtualDom::new(app);
@@ -147,11 +147,11 @@ impl TouchUiSystem {
 
 /// The shell is itself a [`FrameSource`], so backends (preview WebSocket now,
 /// DRM later) can drive it without knowing about Dioxus or Blitz. The physical
-/// viewport is owned by the backend (see [`Backend::initialize`](touch_ui_renderer::Backend::initialize));
+/// viewport is owned by the backend (see [`Backend::initialize`](touchbard_renderer::Backend::initialize));
 /// the shell only renders frames and accepts input.
-impl FrameSource for TouchUiSystem {
+impl FrameSource for TouchbardSystem {
     fn handle_pointer_event(&mut self, event: PointerEvent) {
-        TouchUiSystem::handle_pointer_event(self, event);
+        TouchbardSystem::handle_pointer_event(self, event);
     }
 
     fn poll_and_render(&mut self) -> Frame {
@@ -165,8 +165,8 @@ mod tests {
     use super::*;
     use dioxus::prelude::*;
     use std::sync::atomic::{AtomicI32, Ordering};
-    use touch_ui_renderer::PointerButton;
-    use touch_ui_renderer::PointerEvent as UiPointerEvent;
+    use touchbard_renderer::PointerButton;
+    use touchbard_renderer::PointerEvent as UiPointerEvent;
 
     /// Mirror of the `counter` signal used to assert click direction.
     static COUNTER: AtomicI32 = AtomicI32::new(0);
@@ -174,7 +174,7 @@ mod tests {
     fn test_app() -> Element {
         rsx! {
             div {
-                "Hello Touch UI"
+                "Hello Touchbard"
             }
         }
     }
@@ -186,7 +186,7 @@ mod tests {
         rsx! {
             div {
                 style: "width: 100%; height: 100%; display: flex; flex-direction: row; align-items: center; justify-content: center; gap: 8px; background: #1a1b26; color: #c0caf5; font-family: system-ui, sans-serif; font-size: 12px; overflow: hidden;",
-                div { "Touch UI Demo" }
+                div { "Touchbard Demo" }
                 div {
                     style: "width: 100px; text-align: center; background: #24283b; border-radius: 3px; border: 1px solid #414868;",
                     "Count: {counter}"
@@ -214,7 +214,7 @@ mod tests {
     }
 
     /// Full down/up with a preceding move (normal click).
-    fn click(sys: &mut TouchUiSystem, x: f32, y: f32) {
+    fn click(sys: &mut TouchbardSystem, x: f32, y: f32) {
         for kind in [
             PointerEventKind::Move,
             PointerEventKind::Down,
@@ -233,7 +233,7 @@ mod tests {
 
     /// Release without a preceding move (stale hover): the click must still
     /// route to the node under the release position.
-    fn click_stale(sys: &mut TouchUiSystem, x: f32, y: f32) {
+    fn click_stale(sys: &mut TouchbardSystem, x: f32, y: f32) {
         for kind in [PointerEventKind::Down, PointerEventKind::Up] {
             sys.handle_pointer_event(UiPointerEvent {
                 x,
@@ -253,7 +253,7 @@ mod tests {
             height: 30,
             scale_factor: 1.0,
         };
-        let system = TouchUiSystem::new(test_app, config);
+        let system = TouchbardSystem::new(test_app, config);
         assert_eq!(system.config().width, 100);
         assert_eq!(system.config().height, 30);
         assert_eq!(system.config().logical_width(), 100.0);
@@ -267,7 +267,7 @@ mod tests {
             height: 30,
             scale_factor: 1.0,
         };
-        let mut system = TouchUiSystem::new(test_app, config);
+        let mut system = TouchbardSystem::new(test_app, config);
         system.poll();
         let frame = system.render();
         assert_eq!(frame.width, 100);
@@ -282,7 +282,7 @@ mod tests {
             height: 30,
             scale_factor: 1.0,
         };
-        let mut system = TouchUiSystem::new(test_app, config);
+        let mut system = TouchbardSystem::new(test_app, config);
         system.resize(200, 60);
         system.poll();
         let frame = system.render();
@@ -300,7 +300,7 @@ mod tests {
     fn test_click_direction_and_stale_hover() {
         COUNTER.store(0, Ordering::SeqCst);
 
-        let mut sys = TouchUiSystem::new(counter_app, preview_config());
+        let mut sys = TouchbardSystem::new(counter_app, preview_config());
         sys.poll();
         let before = sys.render();
 

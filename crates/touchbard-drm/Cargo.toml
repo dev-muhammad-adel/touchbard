@@ -1,0 +1,8 @@
+[package]
+name = "touchbard-drm"
+version = "0.1.0"
+edition = "2021"
+description = "DRM/KMS backend for Touchbar display (scaffolded, not yet implemented)"
+
+[dependencies]
+touchbard-renderer = { path = "../touchbard-renderer" }

@@ -1,8 +1,8 @@
 [package]
-name = "touch-ui-macros"
+name = "touchbard-macros"
 version = "0.1.0"
 edition = "2021"
-description = "Build-time file-based routing for Touch UI: app_router!()"
+description = "Build-time file-based routing for Touchbard: app_router!()"
 
 [lib]
 proc-macro = true

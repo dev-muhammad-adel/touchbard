@@ -1,4 +1,4 @@
-# Touch UI
+# Touchbard
 
 A single-window UI runtime for a Touch Bar / hyper-strip display, plus the
 **Control Center** application that runs on it.
@@ -26,36 +26,36 @@ The example is deliberately thin: an app component, CLI parsing, backend
 construction, and one call to the public entry point:
 
 ```rust
-let backend: Box<dyn touch_ui::Backend> = Box::new(PreviewBackend::from_env());
-touch_ui::run(app_router!(), TouchUiConfig { backend })
+let backend: Box<dyn touchbard::Backend> = Box::new(PreviewBackend::from_env());
+touchbard::run(app_router!(), TouchbardConfig { backend })
 ```
 
 ## Public configuration model
 
 ```rust
-pub struct TouchUiConfig { pub backend: Box<dyn Backend> }
+pub struct TouchbardConfig { pub backend: Box<dyn Backend> }
 
-// Backend is a trait in touch-ui-renderer; the example wires the concrete
+// Backend is a trait in touchbard-renderer; the example wires the concrete
 // backend in the entry crate (so the runtime crate stays backend-agnostic).
 ```
 
-### `PreviewConfig` (touch-ui-preview)
+### `PreviewConfig` (touchbard-preview)
 
 Owns everything the preview backend needs; there is no flat mega-config.
 
 | field          | default           | env override     |
 |----------------|-------------------|------------------|
-| `width`        | `2008` (physical px) | `TOUCH_UI_WIDTH` |
-| `height`       | `60`  (physical px)  | `TOUCH_UI_HEIGHT`|
-| `scale_factor` | `2.0`             | `TOUCH_UI_SCALE` |
-| `bind_addr`    | `127.0.0.1:8888`  | `TOUCH_UI_BIND`  |
+| `width`        | `2008` (physical px) | `TOUCHBARD_WIDTH` |
+| `height`       | `60`  (physical px)  | `TOUCHBARD_HEIGHT`|
+| `scale_factor` | `2.0`             | `TOUCHBARD_SCALE` |
+| `bind_addr`    | `127.0.0.1:8888`  | `TOUCHBARD_BIND`  |
 
 `PreviewConfig::from_env()` applies the environment overrides. A thin wrapper
 struct `PreviewBackend` implements the shared [`Backend`] trait so it can be
-boxed and handed to `touch_ui::run`; its initialization returns exactly the
+boxed and handed to `touchbard::run`; its initialization returns exactly the
 configured/default viewport (2008×60 @ 2.0 by default).
 
-### `DrmConfig` / `DrmBackend` (touch-ui-drm)
+### `DrmConfig` / `DrmBackend` (touchbard-drm)
 
 Deliberately minimal: no width/height/scale/bind, because DRM dimensions will
 come from the display connector at runtime. `DrmBackend` implements
@@ -68,7 +68,7 @@ The runtime performs backend initialization first, then builds the UI system,
 then hands control to the backend:
 
 ```text
-backend.initialize()   →  authoritative Viewport   →  TouchUiSystem  →  backend.run(source)
+backend.initialize()   →  authoritative Viewport   →  TouchbardSystem  →  backend.run(source)
         (discover/probe/configure the display)      (created at that viewport)  (presents frames + input)
 ```
 
@@ -80,29 +80,29 @@ system or fabricate a viewport.
 
 ```text
 control-center (example/entry)
-  ├→ touch-ui               → touch-ui-renderer, touch-ui-macros
-  ├→ touch-ui-preview       → touch-ui-renderer
-  └→ touch-ui-drm           → touch-ui-renderer
+  ├→ touchbard               → touchbard-renderer, touchbard-macros
+  ├→ touchbard-preview       → touchbard-renderer
+  └→ touchbard-drm           → touchbard-renderer
 ```
 
-The core runtime crate (`touch-ui`) depends **only** on `touch-ui-renderer`
-(and the macros crate). It does **not** depend on `touch-ui-preview` or
-`touch-ui-drm`. The concrete backends depend only on `touch-ui-renderer` for
+The core runtime crate (`touchbard`) depends **only** on `touchbard-renderer`
+(and the macros crate). It does **not** depend on `touchbard-preview` or
+`touchbard-drm`. The concrete backends depend only on `touchbard-renderer` for
 the shared boundary (`Frame`, `PointerEvent`, `Viewport`, `FrameSource`,
 `Backend`), and the entry crate (`control-center`) is where they are wired up
 into a `Box<dyn Backend>` and handed to the runtime.
 
-The two key boundary traits live in `touch-ui-renderer`:
+The two key boundary traits live in `touchbard-renderer`:
 
 - **`FrameSource`** (the app/runtime side): `handle_pointer_event`,
-  `poll_and_render`. Implemented by `TouchUiSystem` and consumed by backends.
+  `poll_and_render`. Implemented by `TouchbardSystem` and consumed by backends.
   It is exclusively about the rendered UI/frame side - it does not expose
   physical display properties.
 - **`Backend`** (the output/display side): `initialize` → [`Viewport`], `run`.
   Implemented by `PreviewBackend` and `DrmBackend` and consumed by the runtime.
 
 The [`Viewport`] returned by `Backend::initialize` is the single authoritative
-viewport: the runtime creates `TouchUiSystem` at exactly those dimensions and
+viewport: the runtime creates `TouchbardSystem` at exactly those dimensions and
 no other accessor exposes a copy.
 
 ## Workspace layout
@@ -110,16 +110,16 @@ no other accessor exposes a copy.
 | package              | responsibility                                                                 |
 |----------------------|---------------------------------------------------------------------------------|
 | `control-center`     | Workspace root; `examples/control-center/main.rs` is the thin application       |
-| `touch-ui`           | Public API (`run`, config, system), Dioxus+Blitz document, input dispatch       |
-| `touch-ui-renderer`  | Boundary types `Frame`/`PointerEvent`, `FrameSource`/`Backend` traits, CPU renderer |
-| `touch-ui-preview`   | [`PreviewBackend`], WebSocket server, `PreviewConfig`, binary protocol (v1)     |
-| `touch-ui-drm`       | [`DrmBackend`] scaffold + `DrmConfig` only                                     |
+| `touchbard`           | Public API (`run`, config, system), Dioxus+Blitz document, input dispatch       |
+| `touchbard-renderer`  | Boundary types `Frame`/`PointerEvent`, `FrameSource`/`Backend` traits, CPU renderer |
+| `touchbard-preview`   | [`PreviewBackend`], WebSocket server, `PreviewConfig`, binary protocol (v1)     |
+| `touchbard-drm`       | [`DrmBackend`] scaffold + `DrmConfig` only                                     |
 
 The whole pipeline is single-threaded (Blitz documents are not `Send`). Each
 backend owns its own runtime: the preview backend builds a current-thread Tokio
 runtime + `LocalSet` inside its own `Backend::run` method. The core runtime
-(`touch_ui::run`) initializes the backend (getting the authoritative viewport),
-creates the `TouchUiSystem` at that viewport, renders once to prove the
+(`touchbard::run`) initializes the backend (getting the authoritative viewport),
+creates the `TouchbardSystem` at that viewport, renders once to prove the
 pipeline works, then hands control to the backend.
 
 ## Frame pixel format
@@ -130,7 +130,7 @@ into `Frame.data` untouched. A backend that needs a different format must conver
 at its own boundary (e.g. the preview browser un-premultiplies because
 `canvas.putImageData` requires straight alpha).
 
-## File-based routing (`touch_ui::routing`)
+## File-based routing (`touchbard::routing`)
 
 The `control-center` example is a **file-based app**: route components live in
 `examples/control-center/app/`, next to the entry point that owns them, and are
@@ -172,12 +172,12 @@ catch-alls (`[[...slug]]`, rejected with a clear error), API routes, metadata.
 The example entry is still thin:
 
 ```rust
-touch_ui::run(touch_ui::routing::app_router!(), TouchUiConfig { backend })
+touchbard::run(touchbard::routing::app_router!(), TouchbardConfig { backend })
 ```
 
 `app_router!()` is an expression macro: it expands to the generated root
 router component (a `fn() -> Element`), so it plugs directly into
-`touch_ui::run` — no separate `Router` symbol to import.
+`touchbard::run` — no separate `Router` symbol to import.
 
 ## Preview protocol
 

@@ -1,4 +1,4 @@
-// Touch UI Preview client.
+// Touchbard Preview client.
 //
 // Receives real RGBA framebuffers over WebSocket and draws them to a canvas.
 // Sends pointer events back to the Rust runtime. This is a display/debug

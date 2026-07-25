@@ -1,7 +1,7 @@
 //! Settings index (`/settings`).
 
 use dioxus::prelude::*;
-use touch_ui::routing::use_navigate;
+use touchbard::routing::use_navigate;
 
 #[component]
 pub fn Page() -> Element {

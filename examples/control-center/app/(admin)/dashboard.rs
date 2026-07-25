@@ -4,7 +4,7 @@
 //! appear in the URL. The `Page` still lives in its own module namespace.
 
 use dioxus::prelude::*;
-use touch_ui::routing::use_route;
+use touchbard::routing::use_route;
 
 #[component]
 pub fn Page() -> Element {

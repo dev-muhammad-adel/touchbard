@@ -2,22 +2,22 @@
 name = "control-center"
 version = "0.1.0"
 edition = "2021"
-description = "Control Center - the Touch Bar application (thin entry point for touch_ui::run)"
+description = "Control Center - the Touch Bar application (thin entry point for touchbard::run)"
 
 [workspace]
 resolver = "2"
 members = [
-    "crates/touch-ui",
-    "crates/touch-ui-macros",
-    "crates/touch-ui-renderer",
-    "crates/touch-ui-preview",
-    "crates/touch-ui-drm",
+    "crates/touchbard",
+    "crates/touchbard-macros",
+    "crates/touchbard-renderer",
+    "crates/touchbard-preview",
+    "crates/touchbard-drm",
 ]
 
 [dependencies]
-touch-ui = { path = "crates/touch-ui" }
-touch-ui-preview = { path = "crates/touch-ui-preview" }
-touch-ui-drm = { path = "crates/touch-ui-drm" }
+touchbard = { path = "crates/touchbard" }
+touchbard-preview = { path = "crates/touchbard-preview" }
+touchbard-drm = { path = "crates/touchbard-drm" }
 dioxus = { workspace = true }
 
 [workspace.dependencies]

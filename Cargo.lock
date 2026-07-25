@@ -392,9 +392,9 @@ name = "control-center"
 version = "0.1.0"
 dependencies = [
  "dioxus",
- "touch-ui",
- "touch-ui-drm",
- "touch-ui-preview",
+ "touchbard",
+ "touchbard-drm",
+ "touchbard-preview",
 ]
 
 [[package]]
@@ -3315,7 +3315,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "touch-ui"
+name = "touchbard"
 version = "0.1.0"
 dependencies = [
  "blitz-dom",
@@ -3325,21 +3325,21 @@ dependencies = [
  "dioxus-core",
  "dioxus-html",
  "dioxus-native-dom",
- "touch-ui-macros",
- "touch-ui-renderer",
+ "touchbard-macros",
+ "touchbard-renderer",
  "tracing",
  "tracing-subscriber",
 ]
 
 [[package]]
-name = "touch-ui-drm"
+name = "touchbard-drm"
 version = "0.1.0"
 dependencies = [
- "touch-ui-renderer",
+ "touchbard-renderer",
 ]
 
 [[package]]
-name = "touch-ui-macros"
+name = "touchbard-macros"
 version = "0.1.0"
 dependencies = [
  "proc-macro2",
@@ -3348,7 +3348,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "touch-ui-preview"
+name = "touchbard-preview"
 version = "0.1.0"
 dependencies = [
  "base64",
@@ -3358,12 +3358,12 @@ dependencies = [
  "sha1",
  "tokio",
  "tokio-tungstenite",
- "touch-ui-renderer",
+ "touchbard-renderer",
  "tracing",
 ]
 
 [[package]]
-name = "touch-ui-renderer"
+name = "touchbard-renderer"
 version = "0.1.0"
 dependencies = [
  "anyrender",

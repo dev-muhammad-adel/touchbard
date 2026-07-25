@@ -3,9 +3,9 @@
 use std::cell::RefCell;
 use std::rc::Rc;
 
-use crate::system::TouchUiSystem;
-use crate::TouchUiConfig;
-use touch_ui_renderer::{FrameSource, Viewport};
+use crate::system::TouchbardSystem;
+use crate::TouchbardConfig;
+use touchbard_renderer::{FrameSource, Viewport};
 use tracing::info;
 
 /// A Dioxus app component: `fn() -> Element`.
@@ -44,7 +44,7 @@ impl std::error::Error for RunError {
 /// backend lifecycle in order:
 ///
 /// ```text
-/// backend.initialize()  →  authoritative Viewport  →  TouchUiSystem  →  backend.run(source)
+/// backend.initialize()  →  authoritative Viewport  →  TouchbardSystem  →  backend.run(source)
 /// ```
 ///
 /// The backend discovers its display first (for the preview, its configured
@@ -52,7 +52,7 @@ impl std::error::Error for RunError {
 /// then is the UI system created at exactly that viewport. The backend then
 /// owns its event loop and presentation until the UI exits. Initialization
 /// failures (e.g. DRM not implemented) abort cleanly with [`RunError::Initialize`].
-pub fn run(app: AppFn, config: TouchUiConfig) -> Result<(), RunError> {
+pub fn run(app: AppFn, config: TouchbardConfig) -> Result<(), RunError> {
     // Best-effort: init if the application has not already configured logging.
     let _ = tracing_subscriber::fmt()
         .with_max_level(tracing::Level::INFO)
@@ -64,7 +64,7 @@ pub fn run(app: AppFn, config: TouchUiConfig) -> Result<(), RunError> {
     let viewport: Viewport = backend.initialize().map_err(RunError::Initialize)?;
 
     // Phase 2: create the UI system at exactly that viewport.
-    let system = Rc::new(RefCell::new(TouchUiSystem::new(app, viewport)));
+    let system = Rc::new(RefCell::new(TouchbardSystem::new(app, viewport)));
 
     // Render once to prove the pipeline works, before ceding control to the
     // backend's own event loop.
@@ -88,7 +88,7 @@ pub fn run(app: AppFn, config: TouchUiConfig) -> Result<(), RunError> {
 mod tests {
     use super::*;
     use dioxus::prelude::*;
-    use touch_ui_renderer::{Backend, FrameSource, Viewport};
+    use touchbard_renderer::{Backend, FrameSource, Viewport};
 
     fn empty_app() -> Element {
         rsx! { div {} }
@@ -123,14 +123,14 @@ mod tests {
         }
     }
 
-    /// `run` must perform: backend initialize → create TouchUiSystem at the
+    /// `run` must perform: backend initialize → create TouchbardSystem at the
     /// returned viewport → hand it to `backend.run`, in that order, with no
     /// backend lifecycle details leaked to the caller.
     #[test]
     fn run_initializes_backend_then_system_then_hands_over() {
         let log = Rc::new(RefCell::new(Vec::new()));
         let backend = LifecycleBackend { log: Rc::clone(&log) };
-        let config = TouchUiConfig {
+        let config = TouchbardConfig {
             backend: Box::new(backend),
         };
         run(empty_app, config).expect("run succeeds");
@@ -158,7 +158,7 @@ mod tests {
             }
         }
 
-        let config = TouchUiConfig {
+        let config = TouchbardConfig {
             backend: Box::new(FailingBackend),
         };
         match run(empty_app, config) {

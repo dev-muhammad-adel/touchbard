@@ -45,7 +45,7 @@ impl Viewport {
 ///   pointer input into the runtime and presents the frames it produces.
 ///
 /// The two sides meet only at this boundary: the runtime
-/// ([`crate::FrameSource`] impl, in practice `TouchUiSystem`) knows nothing
+/// ([`crate::FrameSource`] impl, in practice `TouchbardSystem`) knows nothing
 /// about a backend, and a backend knows nothing about Dioxus or Blitz.
 ///
 /// Lifecycle: `initialize` → create the UI system at the returned
@@ -53,8 +53,8 @@ impl Viewport {
 /// are propagated as errors, never panics and never fake viewports.
 ///
 /// Implemented by the concrete backend crates:
-/// - `touch-ui-preview`: browser canvas over the WebSocket preview protocol,
-/// - `touch-ui-drm`: DRM/KMS output (scaffolded, not yet implemented).
+/// - `touchbard-preview`: browser canvas over the WebSocket preview protocol,
+/// - `touchbard-drm`: DRM/KMS output (scaffolded, not yet implemented).
 pub trait Backend {
     /// Initialize the backend, returning the physical [`Viewport`] the UI must
     /// target.

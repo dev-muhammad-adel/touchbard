@@ -6,7 +6,7 @@ use crate::{Frame, PointerEvent};
 /// input.
 ///
 /// Implemented by the runtime shell ([`crate`]-agnostic: in practice
-/// `TouchUiSystem`) and consumed by every backend - the WebSocket preview now,
+/// `TouchbardSystem`) and consumed by every backend - the WebSocket preview now,
 /// DRM/KMS later - so a backend never needs to know about Dioxus or Blitz.
 /// The shared object is `Rc<RefCell<dyn FrameSource>>` and is driven on a
 /// single thread (the underlying document is not `Send`).

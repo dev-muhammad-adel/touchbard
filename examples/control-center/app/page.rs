@@ -1,4 +1,4 @@
-//! Home page (`/`): the classic Touch UI counter demo.
+//! Home page (`/`): the classic Touchbard counter demo.
 
 use dioxus::prelude::*;
 
@@ -10,7 +10,7 @@ pub fn Page() -> Element {
         div {
             style: "display: flex; flex-direction: row; align-items: center; gap: 6px;",
 
-            span { "Touch UI Demo" }
+            span { "Touchbard Demo" }
 
             div {
                 style: "width: 64px; text-align: center; background: #3b4261; border: 1px solid #565f89; border-radius: 3px; color: #c0caf5; line-height: 12px;",

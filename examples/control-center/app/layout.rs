@@ -6,7 +6,7 @@
 //! in the component tree).
 
 use dioxus::prelude::*;
-use touch_ui::routing::{use_navigate, use_route};
+use touchbard::routing::{use_navigate, use_route};
 
 #[component]
 pub fn Layout(children: Element) -> Element {

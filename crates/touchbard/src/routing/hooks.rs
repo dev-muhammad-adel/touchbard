@@ -9,7 +9,7 @@ fn navigation() -> Navigation {
     dioxus::prelude::try_consume_context::<Navigation>().unwrap_or_else(|| {
         panic!(
             "routing hook used outside the app_router!() generated component. \
-             Pass `touch_ui::routing::app_router!()` straight to `touch_ui::run`."
+             Pass `touchbard::routing::app_router!()` straight to `touchbard::run`."
         )
     })
 }

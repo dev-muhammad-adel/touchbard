@@ -1,17 +1,17 @@
-//! `app_router!()` — build-time, file-based routing for Touch UI.
+//! `app_router!()` — build-time, file-based routing for Touchbard.
 //!
 //! This is an *expression* macro: invoking it inside the app source file (e.g.
 //! `examples/control-center/main.rs`) expands to the generated root Dioxus
-//! component (`fn() -> Element`), ready to hand straight to [`touch_ui::run`]:
+//! component (`fn() -> Element`), ready to hand straight to [`touchbard::run`]:
 //!
 //! ```text
-//! touch_ui::run(
-//!     touch_ui::routing::app_router!(),        // discovers the `app/` tree next to the source file
-//!     TouchUiConfig { backend },
+//! touchbard::run(
+//!     touchbard::routing::app_router!(),        // discovers the `app/` tree next to the source file
+//!     TouchbardConfig { backend },
 //! )
-//! touch_ui::run(
-//!     touch_ui::routing::app_router!("app"),   // explicit path (relative to the source file)
-//!     TouchUiConfig { backend },
+//! touchbard::run(
+//!     touchbard::routing::app_router!("app"),   // explicit path (relative to the source file)
+//!     TouchbardConfig { backend },
 //! )
 //! ```
 //!
@@ -35,7 +35,7 @@
 //!
 //! The expansion does **not** declare a caller-visible `Router` symbol: the
 //! generated component is referenced as the expression value itself, so apps
-//! pass the macro directly to [`touch_ui::run`].
+//! pass the macro directly to [`touchbard::run`].
 //!
 //! Route groups `(name)` follow the Next.js App Router semantics: they add a
 //! directory but no URL segment. A group's `layout.rs` acts like a normal
@@ -48,7 +48,7 @@
 //! The generated code only contains plain Rust + `include!`; no dynamic
 //! loading, evaluation, or interpretation of app source happens. The route
 //! *engine* (navigation state, hooks, path splitting, param storage) lives in
-//! [`touch_ui::routing`].
+//! [`touchbard::routing`].
 
 use proc_macro::TokenStream;
 use proc_macro2::{Span, TokenStream as Tokens2};
@@ -850,7 +850,7 @@ fn emit_node_fn(node: &Node, gen: &mut Gen) {
     };
 
     gen.match_fns.push(quote! {
-        fn #fname(segs: &[&str], params: &mut touch_ui::routing::RouteParams) -> __RouteId {
+        fn #fname(segs: &[&str], params: &mut touchbard::routing::RouteParams) -> __RouteId {
             match segs.first() {
                 #(#lits)*
                 #none_arm
@@ -1138,7 +1138,7 @@ fn generate(app_root: &Path) -> Result<Tokens2, String> {
     let output = quote! {
         {
             #[allow(dead_code, unused_imports, non_snake_case, non_upper_case_globals, clippy::all)]
-            mod ___touch_ui_app_router {
+            mod ___touchbard_app_router {
                 use dioxus::prelude::*;
 
                 #mods
@@ -1151,9 +1151,9 @@ fn generate(app_root: &Path) -> Result<Tokens2, String> {
 
                 #(#match_fns)*
 
-                /// Root router component, wired to `touch_ui::routing` navigation state.
+                /// Root router component, wired to `touchbard::routing` navigation state.
                 pub fn Router() -> Element {
-                    use touch_ui::routing::{Navigation, RouteParams};
+                    use touchbard::routing::{Navigation, RouteParams};
 
                     let path = use_signal(|| String::from("/"));
                     let mut params = use_signal(RouteParams::default);
@@ -1161,7 +1161,7 @@ fn generate(app_root: &Path) -> Result<Tokens2, String> {
 
                     let current = path();
                     let mut matched = RouteParams::default();
-                    let id = __m_root(&touch_ui::routing::split_path(&current), &mut matched);
+                    let id = __m_root(&touchbard::routing::split_path(&current), &mut matched);
                     if *params.peek() != matched {
                         params.set(matched);
                     }
@@ -1173,7 +1173,7 @@ fn generate(app_root: &Path) -> Result<Tokens2, String> {
                 }
             }
 
-            ___touch_ui_app_router::Router
+            ___touchbard_app_router::Router
         }
     };
 
@@ -1189,7 +1189,7 @@ mod tests {
     impl Scratch {
         fn new() -> Self {
             let dir = std::env::temp_dir().join(format!(
-                "touch_ui_macros_test_{}_{}",
+                "touchbard_macros_test_{}_{}",
                 std::process::id(),
                 std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
@@ -1419,11 +1419,11 @@ mod tests {
         // generated root component (fn item, coercible to `fn() -> Element`).
         assert!(trimmed.starts_with('{'), "expansion is a block expression: {out}");
         assert!(
-            trimmed.ends_with("___touch_ui_app_router :: Router }"),
+            trimmed.ends_with("___touchbard_app_router :: Router }"),
             "block tail evaluates to the private router fn: {out}"
         );
         assert!(
-            out.contains("mod ___touch_ui_app_router"),
+            out.contains("mod ___touchbard_app_router"),
             "private module still generated: {out}"
         );
         assert!(

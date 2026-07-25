@@ -1,7 +1,7 @@
-//! Routing runtime for the Touch UI framework.
+//! Routing runtime for the Touchbard framework.
 //!
 //! The route *tree* is discovered from the filesystem at build time by the
-//! [`app_router!`] proc-macro (`touch-ui-macros`). This module is the
+//! [`app_router!`] proc-macro (`touchbard-macros`). This module is the
 //! framework side of that contract: everything the generated code and the app
 //! code need to navigate and to read the current route.
 //!
@@ -11,10 +11,10 @@
 //! * The generated router component — produced by the [`app_router!`]
 //!   proc-macro. The macro is an *expression* that expands to the root router
 //!   component (`fn() -> Element`), so apps pass it straight to
-//!   [`touch_ui::run`](crate::run):
+//!   [`touchbard::run`](crate::run):
 //!
 //!   ```text
-//!   touch_ui::run(touch_ui::routing::app_router!(), TouchUiConfig { backend })
+//!   touchbard::run(touchbard::routing::app_router!(), TouchbardConfig { backend })
 //!   ```
 //!
 //!   The generated component matches the current path against the build-time
@@ -52,6 +52,6 @@ pub mod hooks;
 pub use core::{Navigation, Navigator, RouteParams, split_path};
 pub use hooks::{use_navigate, use_route, use_route_param, use_route_params};
 
-/// Re-export of the build-time routing macro (defined in `touch-ui-macros`).
+/// Re-export of the build-time routing macro (defined in `touchbard-macros`).
 /// An *expression* macro: expands to the generated root router component.
-pub use touch_ui_macros::app_router;
+pub use touchbard_macros::app_router;
