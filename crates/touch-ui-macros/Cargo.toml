@@ -1,0 +1,13 @@
+[package]
+name = "touch-ui-macros"
+version = "0.1.0"
+edition = "2021"
+description = "Build-time file-based routing for Touch UI: app_router!()"
+
+[lib]
+proc-macro = true
+
+[dependencies]
+proc-macro2 = "1"
+quote = "1"
+syn = "2"

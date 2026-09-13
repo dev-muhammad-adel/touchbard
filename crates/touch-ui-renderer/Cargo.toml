@@ -1,0 +1,12 @@
+[package]
+name = "touch-ui-renderer"
+version = "0.1.0"
+edition = "2021"
+description = "Rendering backends and shared boundary types for Touch UI: CPU framebuffer rendering"
+
+[dependencies]
+anyrender = { workspace = true }
+anyrender_vello_cpu = { workspace = true }
+blitz-traits = { workspace = true }
+keyboard-types = { workspace = true }
+tracing = { workspace = true }

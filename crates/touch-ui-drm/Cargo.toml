@@ -1,0 +1,8 @@
+[package]
+name = "touch-ui-drm"
+version = "0.1.0"
+edition = "2021"
+description = "DRM/KMS backend for Touch Bar display (scaffolded, not yet implemented)"
+
+[dependencies]
+touch-ui-renderer = { path = "../touch-ui-renderer" }

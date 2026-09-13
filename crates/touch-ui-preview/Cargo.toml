@@ -1,0 +1,16 @@
+[package]
+name = "touch-ui-preview"
+version = "0.1.0"
+edition = "2021"
+description = "WebSocket preview backend for Touch UI: render framebuffer to a browser canvas"
+
+[dependencies]
+touch-ui-renderer = { path = "../touch-ui-renderer" }
+tokio = { workspace = true }
+tokio-tungstenite = { workspace = true }
+futures-util = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+base64 = { workspace = true }
+sha1 = { workspace = true }
+tracing = { workspace = true }

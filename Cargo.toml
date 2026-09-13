@@ -1,0 +1,62 @@
+[package]
+name = "control-center"
+version = "0.1.0"
+edition = "2021"
+description = "Control Center - the Touch Bar application (thin entry point for touch_ui::run)"
+
+[workspace]
+resolver = "2"
+members = [
+    "crates/touch-ui",
+    "crates/touch-ui-macros",
+    "crates/touch-ui-renderer",
+    "crates/touch-ui-preview",
+    "crates/touch-ui-drm",
+]
+
+[dependencies]
+touch-ui = { path = "crates/touch-ui" }
+touch-ui-preview = { path = "crates/touch-ui-preview" }
+touch-ui-drm = { path = "crates/touch-ui-drm" }
+dioxus = { workspace = true }
+
+[workspace.dependencies]
+# Dioxus ecosystem
+dioxus = { version = "0.7", features = ["minimal"] }
+dioxus-core = "0.7"
+dioxus-html = "0.7"
+dioxus-native-dom = "0.7"
+
+# Blitz ecosystem (DOM/layout/style/paint)
+blitz-dom = "0.2"
+blitz-paint = "0.2"
+blitz-traits = "0.2"
+
+# AnyRender
+anyrender = "0.6"
+anyrender_vello_cpu = "0.8"
+
+# Input types shared with Blitz
+keyboard-types = "0.7"
+
+# Vello CPU
+vello_cpu = "0.0.4"
+
+# Async / runtime
+tokio = { version = "1", features = ["full"] }
+
+# WebSocket server
+tokio-tungstenite = "0.26"
+futures-util = "0.3"
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = "0.3"
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# WebSocket handshake helpers
+base64 = "0.22"
+sha1 = "0.10"
