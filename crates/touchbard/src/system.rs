@@ -13,8 +13,8 @@ use tracing::trace;
 ///
 /// This is the authoritative physical-pixel framebuffer size plus a scale
 /// factor, produced by the selected backend at initialization (the preview's
-/// `PreviewConfig` defaults/env today, future DRM connector discovery later).
-/// The runtime creates the system at exactly this viewport; there is no
+/// configured/default framebuffer size, or the DRM connector's mode). The
+/// runtime creates the system at exactly this viewport; there is no
 /// independent copy anywhere else.
 pub use touchbard_renderer::Viewport;
 
@@ -34,6 +34,9 @@ pub struct TouchbardSystem {
     pub document: DioxusDocument,
     renderer: CpuRenderer,
     config: Viewport,
+    /// When the system was created; rendered frames advance CSS animations
+    /// (transitions/keyframes) against this clock.
+    animation_started: std::time::Instant,
 }
 
 impl TouchbardSystem {
@@ -63,6 +66,7 @@ impl TouchbardSystem {
             document,
             renderer: CpuRenderer::new(config.width, config.height),
             config,
+            animation_started: std::time::Instant::now(),
         };
         system.document.initial_build();
         system
@@ -110,9 +114,11 @@ impl TouchbardSystem {
         let scale = self.config.scale_factor;
 
         // blitz-paint requires styles and layout to be resolved. `resolve()`
-        // restyles the tree and relayouts it (the timestamp drives CSS
-        // animations; 0.0 is fine for static UIs).
-        self.document.resolve(0.0);
+        // restyles the tree and relayouts it; the timestamp drives CSS
+        // animations, so each rendered frame advances them against the system's
+        // own clock (static UIs are unaffected by the value).
+        let now = self.animation_started.elapsed().as_secs_f64();
+        self.document.resolve(now);
 
         self.renderer.render(
             |scene| {
@@ -145,8 +151,8 @@ impl TouchbardSystem {
     }
 }
 
-/// The shell is itself a [`FrameSource`], so backends (preview WebSocket now,
-/// DRM later) can drive it without knowing about Dioxus or Blitz. The physical
+/// The shell is itself a [`FrameSource`], so any backend (preview WebSocket or
+/// DRM) can drive it without knowing about Dioxus or Blitz. The physical
 /// viewport is owned by the backend (see [`Backend::initialize`](touchbard_renderer::Backend::initialize));
 /// the shell only renders frames and accepts input.
 impl FrameSource for TouchbardSystem {
@@ -318,7 +324,10 @@ mod tests {
         ] {
             click(&mut sys, x, 15.0);
             let got = COUNTER.load(Ordering::SeqCst);
-            assert_eq!(got, expect, "button at x={x:.1} must move counter to {expect}");
+            assert_eq!(
+                got, expect,
+                "button at x={x:.1} must move counter to {expect}"
+            );
         }
 
         let after = sys.render();

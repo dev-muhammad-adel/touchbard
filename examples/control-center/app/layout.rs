@@ -19,11 +19,17 @@ pub fn Layout(children: Element) -> Element {
 
             // Navigation strip.
             div {
-                style: "flex-shrink: 0; height: 14px; display: flex; flex-direction: row; align-items: center; gap: 4px; padding: 0 6px; background: #16161e; border-bottom: 1px solid #24283b;",
+                style: "flex-shrink: 0; height: 12px; display: flex; flex-direction: row; align-items: center; gap: 2px; padding: 0 4px; background: #16161e; border-bottom: 1px solid #24283b;",
 
-                span { style: "color: #7aa2f7; font-weight: 600; margin-right: 4px; font-size: 10px;", "Control Center" }
+                span { style: "color: #7aa2f7; font-weight: 600; margin-right: 4px; font-size: 9px;", "Ctrl Center" }
 
                 NavBtn { to: "/", label: "Home" }
+                NavBtn { to: "/showcase/text", label: "Text" }
+                NavBtn { to: "/showcase/widgets", label: "Widgets" }
+                NavBtn { to: "/showcase/panels", label: "Panels" }
+                NavBtn { to: "/showcase/motion", label: "Motion" }
+                NavBtn { to: "/showcase/counter", label: "Counter" }
+                NavBtn { to: "/showcase/system", label: "System" }
                 NavBtn { to: "/about", label: "About" }
                 NavBtn { to: "/settings", label: "Settings" }
                 NavBtn { to: "/settings/general", label: "General" }
@@ -34,14 +40,14 @@ pub fn Layout(children: Element) -> Element {
                 NavBtn { to: "/no/such/route", label: "Bad" }
 
                 button {
-                    style: "height: 12px; line-height: 12px; font-size: 10px; color: #c0caf5; background: #24283b; border: 1px solid #414868; border-radius: 3px; padding: 0 8px; cursor: pointer;",
+                    style: "height: 9px; line-height: 9px; font-size: 9px; color: #c0caf5; background: #24283b; border: 1px solid #414868; border-radius: 3px; padding: 0 6px; cursor: pointer;",
                     onclick: move |_| { clicks += 1; },
                     "Kick"
                 }
 
                 span {
-                    style: "margin-left: auto; color: #565f89; font-size: 10px;",
-                    "clicks: {clicks} · route: {route}"
+                    style: "margin-left: auto; color: #565f89; font-size: 9px; white-space: nowrap; overflow: hidden;",
+                    "clicks: {clicks} · {route}"
                 }
             }
 
@@ -60,7 +66,7 @@ fn NavBtn(to: String, label: String) -> Element {
     let navigate = use_navigate();
     rsx! {
         button {
-            style: "height: 12px; line-height: 12px; font-size: 10px; color: #c0caf5; background: #24283b; border: 1px solid #414868; border-radius: 3px; padding: 0 8px; cursor: pointer;",
+            style: "height: 9px; line-height: 9px; font-size: 9px; color: #c0caf5; background: #24283b; border: 1px solid #414868; border-radius: 3px; padding: 0 6px; cursor: pointer;",
             onclick: move |_| navigate.push(&to),
             "{label}"
         }
