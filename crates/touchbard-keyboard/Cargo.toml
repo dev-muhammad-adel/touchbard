@@ -1,0 +1,9 @@
+[package]
+name = "touchbard-keyboard"
+version = "0.1.0"
+edition = "2021"
+description = "Keyboard input, gestures, and lifecycle handling for Touchbard"
+
+[dependencies]
+libc = "0.2"
+tracing = { workspace = true }

@@ -392,6 +392,7 @@ dependencies = [
  "dioxus",
  "touchbard",
  "touchbard-drm",
+ "touchbard-keyboard",
  "touchbard-preview",
 ]
 
@@ -3386,6 +3387,14 @@ dependencies = [
  "drm",
  "libc",
  "touchbard-renderer",
+]
+
+[[package]]
+name = "touchbard-keyboard"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "tracing",
 ]
 
 [[package]]

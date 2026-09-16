@@ -32,6 +32,8 @@ use touchbard::{Backend, TouchbardConfig};
 use touchbard_drm::{DrmBackend, DrmConfig};
 use touchbard_preview::PreviewBackend;
 
+mod keyboard;
+
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     if args.iter().any(|a| a == "--help" || a == "-h") {

@@ -12,12 +12,14 @@ members = [
     "crates/touchbard-renderer",
     "crates/touchbard-preview",
     "crates/touchbard-drm",
+    "crates/touchbard-keyboard",
 ]
 
 [dependencies]
 touchbard = { path = "crates/touchbard" }
 touchbard-preview = { path = "crates/touchbard-preview" }
 touchbard-drm = { path = "crates/touchbard-drm" }
+touchbard-keyboard = { path = "crates/touchbard-keyboard" }
 dioxus = { workspace = true }
 
 [workspace.dependencies]
