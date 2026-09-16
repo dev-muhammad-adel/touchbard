@@ -1,8 +1,8 @@
-//! Top-level configuration passed to [`crate::run`].
+//! Top-level configuration passed to [`crate::run()`].
 
 use touchbard_renderer::Backend;
 
-/// Top-level configuration passed to [`crate::run`].
+/// Top-level configuration passed to [`crate::run()`].
 ///
 /// The backend is chosen up front and owns the configuration relevant to it
 /// (the browser preview keeps its own `PreviewConfig` in `touchbard-preview`;

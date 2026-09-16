@@ -11,6 +11,19 @@ use touchbard::routing::{use_navigate, use_route};
 #[component]
 pub fn Layout(children: Element) -> Element {
     let route = use_route();
+
+    // The home route is the full-bleed Touch Bar Playground: it owns the whole
+    // viewport (2008×60) and draws its own chrome, so the generic strip is
+    // skipped there. Every other route keeps the shared strip below.
+    if route == "/" {
+        return rsx! {
+            div {
+                style: "width: 100%; height: 100%; background: #1a1b26; color: #c0caf5; font-family: system-ui, sans-serif;",
+                {children}
+            }
+        };
+    }
+
     let mut clicks = use_signal(|| 0u32);
 
     rsx! {
@@ -30,6 +43,7 @@ pub fn Layout(children: Element) -> Element {
                 NavBtn { to: "/showcase/motion", label: "Motion" }
                 NavBtn { to: "/showcase/counter", label: "Counter" }
                 NavBtn { to: "/showcase/system", label: "System" }
+                NavBtn { to: "/showcase/tiles", label: "Tiles" }
                 NavBtn { to: "/about", label: "About" }
                 NavBtn { to: "/settings", label: "Settings" }
                 NavBtn { to: "/settings/general", label: "General" }

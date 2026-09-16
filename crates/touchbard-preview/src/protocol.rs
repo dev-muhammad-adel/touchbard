@@ -141,6 +141,17 @@ pub fn pong(timestamp_ns: u64) -> Message {
     Message::Binary(bytes.into())
 }
 
+/// Parse a client `PONG` message into the reflected (echoed) ping timestamp.
+///
+/// The client mirrors the 8-byte BE nanoseconds timestamp from the server's
+/// `PING`, prefixed with the `PONG` type byte.
+pub fn parse_pong(bytes: &[u8]) -> Option<u64> {
+    if bytes.len() != 9 || bytes[0] != MsgType::Pong as u8 {
+        return None;
+    }
+    Some(u64::from_be_bytes(bytes[1..9].try_into().ok()?))
+}
+
 /// Parse a client message into an `InputEvent`, if it is one.
 ///
 /// Text messages have the form `INPUT <json>` or `CLICK <json>` / `INPUT:click <json>`.
@@ -170,8 +181,14 @@ mod tests {
         match msg {
             WsMessage::Binary(bytes) => {
                 assert_eq!(bytes[0], MsgType::Frame as u8);
-                assert_eq!(u32::from_be_bytes([bytes[1], bytes[2], bytes[3], bytes[4]]), 2);
-                assert_eq!(u32::from_be_bytes([bytes[5], bytes[6], bytes[7], bytes[8]]), 2);
+                assert_eq!(
+                    u32::from_be_bytes([bytes[1], bytes[2], bytes[3], bytes[4]]),
+                    2
+                );
+                assert_eq!(
+                    u32::from_be_bytes([bytes[5], bytes[6], bytes[7], bytes[8]]),
+                    2
+                );
                 assert_eq!(&bytes[9..], pixels.as_slice());
             }
             other => panic!("expected Binary, got {other:?}"),
@@ -189,8 +206,27 @@ mod tests {
     }
 
     #[test]
+    fn test_pong_parse_roundtrip() {
+        let ts = 1_700_000_000_123_456_789u64;
+        let msg = pong(ts);
+        let WsMessage::Binary(bytes) = msg else {
+            panic!("expected binary pong");
+        };
+        assert_eq!(parse_pong(&bytes), Some(ts));
+        assert_eq!(parse_pong(&bytes[..8]), None); // missing type byte
+        let bad = {
+            let mut b = bytes.as_ref().to_vec();
+            b[0] = MsgType::Frame as u8;
+            b
+        };
+        assert_eq!(parse_pong(&bad), None); // wrong type byte
+    }
+
+    #[test]
     fn test_parse_input_message() {
-        let e = parse_input_message(r#"INPUT {"type":"pointermove","x":12.5,"y":3.0,"button":0,"buttons":0}"#);
+        let e = parse_input_message(
+            r#"INPUT {"type":"pointermove","x":12.5,"y":3.0,"button":0,"buttons":0}"#,
+        );
         assert!(e.is_some());
         let e = e.unwrap();
         assert_eq!(e.r#type, "pointermove");

@@ -6,9 +6,10 @@
 //! relies on. The animated properties below (`background-color`, `opacity`,
 //! `width`, `transform: translateX`) are the only ones the showcase claims.
 //!
-//! It exercises [`TouchbardSystem`] directly — the same object the DRM backend
-//! drives on a ~30 fps loop — so a change that breaks animation (e.g. the
-//! document's animation clock no longer advancing) fails here first.
+//! It exercises [`TouchbardSystem`] directly — the same object the DRM and
+//! preview backends drive through `frame()` on an event-driven loop — so a
+//! change that breaks animation (e.g. the document's animation clock no longer
+//! advancing) fails here first.
 
 use dioxus::prelude::*;
 use std::time::Duration;

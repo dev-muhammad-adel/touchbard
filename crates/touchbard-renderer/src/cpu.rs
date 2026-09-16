@@ -51,7 +51,11 @@ impl CpuRenderer {
         height: u32,
     ) -> Frame {
         let mut frame = Frame::new(width, height, self.format);
+        let paint_start = std::time::Instant::now();
         self.renderer.render(paint, &mut frame.data);
+        crate::diag::record(crate::diag::Ev::Raster {
+            render_us: paint_start.elapsed().as_micros() as u64,
+        });
         frame
     }
 }

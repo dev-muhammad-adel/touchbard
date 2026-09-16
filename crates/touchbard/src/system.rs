@@ -1,9 +1,12 @@
 //! Core `TouchbardSystem`: owns the Dioxus+Blitz document and renders frames.
 
+use std::sync::{Arc, Mutex};
+use std::task::{Context as TaskContext, Waker};
+
 use blitz_dom::Document as _;
 use blitz_paint::paint_scene;
 use blitz_traits::events::UiEvent;
-use blitz_traits::shell::{ColorScheme, Viewport as BlitzViewport};
+use blitz_traits::shell::{ColorScheme, ShellProvider, Viewport as BlitzViewport};
 use dioxus_core::VirtualDom;
 use dioxus_native_dom::{DioxusDocument, DocumentConfig};
 use touchbard_renderer::{CpuRenderer, Frame, FrameSource, PointerEvent, PointerEventKind};
@@ -21,9 +24,27 @@ pub use touchbard_renderer::Viewport;
 /// The central runtime: a Dioxus `VirtualDom` integrated with a Blitz
 /// `BaseDocument`, plus a CPU (Vello) render pipeline.
 ///
+/// The runtime is driven through its [`FrameSource`] half: backends call
+/// [`frame`](FrameSource::frame) whenever any wake signal says a frame might be
+/// wanted, and the runtime produces one only when there is something new to
+/// show:
+///
+///  * Dioxus state changed (the scheduler wakes the host waker registered on
+///    the previous call),
+///  * a redraw was requested through the shell provider (e.g. the hovered
+///    element changed as the cursor moved),
+///  * the document is animating (CSS animations/transitions, `<canvas>`), so a
+///    bounded animation cadence keeps it being re-rendered until it stops.
+///
+/// When the runtime has no work it returns `None` and a backend blocks until
+/// one of those signals fires again — the presentation rate is event-driven,
+/// with the animation cadence (≈60 Hz, via the backend's bounded wait while
+/// animating) as an upper bound, not a fixed render rate.
+///
 /// Operations:
 ///  1. [`TouchbardSystem::new`] creates the document from a Dioxus app function.
-///  2. [`TouchbardSystem::poll`] flushes Dioxus mutations into Blitz.
+///  2. [`TouchbardSystem::frame`] polls Dioxus and renders only when the
+///     document changed, requested a redraw, or is animating.
 ///  3. [`TouchbardSystem::render`] rasterizes the Blitz document into an RGBA
 ///     [`Frame`] via AnyRender + Vello CPU (through `touchbard-renderer`).
 ///
@@ -37,11 +58,65 @@ pub struct TouchbardSystem {
     /// When the system was created; rendered frames advance CSS animations
     /// (transitions/keyframes) against this clock.
     animation_started: std::time::Instant,
+    /// Shared host-wake state read/written by `frame`, `poll`, and the shell
+    /// redraw bridge (which also holds a clone of the [`Arc`]).
+    redraw: Arc<Mutex<RedrawSlot>>,
+    /// Whether at least one frame has been rasterized since creation. The
+    /// initial build mutates the Blitz document even though the Dioxus
+    /// scheduler then reports no pending work, so the first `frame` must render
+    /// unconditionally.
+    rendered: bool,
+    /// Whether at least one host-armed (`wake: Some`) frame has been produced.
+    ///
+    /// Kept separate from `rendered` so that a pre-render with no armed waker
+    /// (e.g. [`run`](crate::run::run)'s initial frame) does not steal the
+    /// backend's guaranteed first present: a backend that arms its waker must
+    /// always receive an initial frame to show.
+    presented_once: bool,
+}
+
+/// Host-wake state shared between the runtime and backends.
+///
+/// `requested` records that a redraw was requested since the last frame (for
+/// example the shell provider firing after the hovered element changed). The
+/// host's waker is re-armed on every `frame` call, and every wake signal —
+/// shell redraw bridge, Dioxus scheduler, or the runtime itself — fires it so
+/// a blocked backend wakes up and asks for a frame.
+#[derive(Default)]
+struct RedrawSlot {
+    waker: Option<Waker>,
+    requested: bool,
+}
+
+/// A [`ShellProvider`] that turns Blitz redraw requests into a runtime wake:
+/// `request_redraw()` marks the redraw-needed flag and notifies the armed host
+/// waker. Replaces the crate-default `DummyShellProvider`, which silently
+/// drops redraw requests.
+struct WakingShellProvider {
+    slot: Arc<Mutex<RedrawSlot>>,
+}
+
+impl ShellProvider for WakingShellProvider {
+    fn request_redraw(&self) {
+        let mut slot = self.slot.lock().unwrap();
+        slot.requested = true;
+        if let Some(waker) = slot.waker.as_ref() {
+            waker.wake_by_ref();
+        }
+    }
 }
 
 impl TouchbardSystem {
     /// Create a new system from a Dioxus app function.
     pub fn new(app: fn() -> dioxus_core::Element, config: Viewport) -> Self {
+        let redraw = Arc::new(Mutex::new(RedrawSlot::default()));
+
+        // Shell redraw requests (hover changes, canvas invalidation, ...) must
+        // reach the host's wake loop, so the system installs its own provider.
+        let shell_provider = WakingShellProvider {
+            slot: Arc::clone(&redraw),
+        };
+
         let vdom = VirtualDom::new(app);
 
         let doc_config = DocumentConfig {
@@ -51,6 +126,7 @@ impl TouchbardSystem {
                 config.scale_factor as f32,
                 ColorScheme::Dark,
             )),
+            shell_provider: Some(Arc::new(shell_provider)),
             ..Default::default()
         };
 
@@ -67,6 +143,9 @@ impl TouchbardSystem {
             renderer: CpuRenderer::new(config.width, config.height),
             config,
             animation_started: std::time::Instant::now(),
+            redraw,
+            rendered: false,
+            presented_once: false,
         };
         system.document.initial_build();
         system
@@ -78,9 +157,76 @@ impl TouchbardSystem {
         self.document.poll(None)
     }
 
-    /// Whether the document needs a redraw (CSS animations, `<canvas>`, etc).
+    /// Poll the VirtualDom with an optional waker for the Dioxus scheduler, and
+    /// flush mutations to the Blitz document. Returns `true` if there was work.
+    ///
+    /// Dioxus needs a `&'static` waker: backends hand the runtime a long-lived
+    /// waker they leak once per run (see `frame`).
+    fn poll_with(&mut self, wake: Option<&'static Waker>) -> bool {
+        match wake {
+            Some(waker) => self.document.poll(Some(TaskContext::from_waker(waker))),
+            None => self.document.poll(None),
+        }
+    }
+
+    /// Whether the document needs animation ticks (CSS animations, `<canvas>`).
+    ///
+    /// Note: a `<canvas>` whose layout never changes keeps `is_animating()`
+    /// true indefinitely (its invalidation is tracked statically by Blitz), so
+    /// `needs_redraw()` can stay true for an idle canvas. The runtime treats
+    /// that as an animated document and keeps producing frames; this is the
+    /// documented Blitz behaviour and is not detected here (no internals are
+    /// inspected).
     pub fn needs_redraw(&self) -> bool {
         self.document.is_animating()
+    }
+
+    /// The shared runtime scheduling step used by backends.
+    ///
+    /// `wake` is the host's long-lived waker (backends leak one per run). The
+    /// previous value — if any — is re-armed for this wait; the Dioxus
+    /// scheduler and the shell redraw bridge both fire it when a frame is
+    /// wanted. Passing `None` keeps the last armed waker in place (useful for a
+    /// one-shot frame that will not block).
+    ///
+    /// Returns a [`Frame`] to present when the document changed, a redraw was
+    /// requested, or the document is animating; `None` when there is nothing to
+    /// present and the caller should block until its wake fires. When it is
+    /// animating, the caller bounds its wait (≈60 Hz cadence) instead of
+    /// blocking indefinitely, so the animation keeps advancing (see
+    /// [`needs_redraw`](Self::needs_redraw)).
+    ///
+    /// A backend that arms its waker (`wake: Some`) is guaranteed at least one
+    /// frame, its initial present: even if the runtime has already rasterized a
+    /// frame with no waker armed (e.g. [`run`](crate::run::run)'s pre-render),
+    /// the first host-armed frame still renders. After that, presentation is
+    /// strictly change-driven.
+    pub fn frame(&mut self, wake: Option<&'static Waker>) -> Option<Frame> {
+        // Consume any redraw request and re-arm the host waker. This happens
+        // *before* polling so a wake signalled by Dioxus during the poll is a
+        // late answer to the frame we are about to produce, not a spurious one
+        // still pending after it.
+        let requested = {
+            let mut slot = self.redraw.lock().unwrap();
+            if let Some(waker) = wake {
+                slot.waker = Some(waker.clone());
+            }
+            std::mem::take(&mut slot.requested)
+        };
+        let changed = self.poll_with(wake);
+        let needs_initial_present = wake.is_some() && !self.presented_once;
+        if !self.rendered || needs_initial_present || changed || requested || self.needs_redraw() {
+            touchbard_renderer::diag::record(touchbard_renderer::diag::Ev::FrameStart {
+                animating: self.needs_redraw(),
+            });
+            let frame = self.render();
+            if wake.is_some() {
+                self.presented_once = true;
+            }
+            Some(frame)
+        } else {
+            None
+        }
     }
 
     /// Handle a pointer event from any backend (preview WebSocket, touch device).
@@ -117,16 +263,29 @@ impl TouchbardSystem {
         // restyles the tree and relayouts it; the timestamp drives CSS
         // animations, so each rendered frame advances them against the system's
         // own clock (static UIs are unaffected by the value).
+        let t0 = std::time::Instant::now();
         let now = self.animation_started.elapsed().as_secs_f64();
         self.document.resolve(now);
+        touchbard_renderer::diag::record(touchbard_renderer::diag::Ev::Flush {
+            now_ms: now * 1000.0,
+            resolve_us: t0.elapsed().as_micros() as u64,
+        });
 
-        self.renderer.render(
+        let frame = self.renderer.render(
             |scene| {
+                let paint_start = std::time::Instant::now();
                 paint_scene(scene, &self.document, scale, width, height);
+                touchbard_renderer::diag::record(touchbard_renderer::diag::Ev::SceneDone {
+                    paint_us: paint_start.elapsed().as_micros() as u64,
+                });
             },
             width,
             height,
-        )
+        );
+        // `Raster` timing is recorded inside `CpuRenderer::render` (wraps the
+        // whole publish + paint + rasterize step).
+        self.rendered = true;
+        frame
     }
 
     /// Resize the viewport. The Dioxus document relayouts to the new size.
@@ -154,15 +313,19 @@ impl TouchbardSystem {
 /// The shell is itself a [`FrameSource`], so any backend (preview WebSocket or
 /// DRM) can drive it without knowing about Dioxus or Blitz. The physical
 /// viewport is owned by the backend (see [`Backend::initialize`](touchbard_renderer::Backend::initialize));
-/// the shell only renders frames and accepts input.
+/// the shell only renders frames, accepts input, and reports whether it is
+/// animating.
 impl FrameSource for TouchbardSystem {
     fn handle_pointer_event(&mut self, event: PointerEvent) {
         TouchbardSystem::handle_pointer_event(self, event);
     }
 
-    fn poll_and_render(&mut self) -> Frame {
-        self.poll();
-        self.render()
+    fn frame(&mut self, wake: Option<&'static Waker>) -> Option<Frame> {
+        TouchbardSystem::frame(self, wake)
+    }
+
+    fn needs_redraw(&self) -> bool {
+        self.needs_redraw()
     }
 }
 
@@ -170,7 +333,9 @@ impl FrameSource for TouchbardSystem {
 mod tests {
     use super::*;
     use dioxus::prelude::*;
-    use std::sync::atomic::{AtomicI32, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
+    use std::sync::Arc;
+    use std::task::{Wake, Waker};
     use touchbard_renderer::PointerButton;
     use touchbard_renderer::PointerEvent as UiPointerEvent;
 
@@ -252,6 +417,240 @@ mod tests {
         sys.poll();
     }
 
+    /// A host waker that just records every wake in an `AtomicBool`.
+    struct TestWake(Arc<AtomicBool>);
+
+    impl Wake for TestWake {
+        fn wake(self: Arc<Self>) {
+            self.0.store(true, Ordering::SeqCst);
+        }
+
+        fn wake_by_ref(self: &Arc<Self>) {
+            self.0.store(true, Ordering::SeqCst);
+        }
+    }
+
+    /// An armed `'static` waker plus its flag, to observe runtime wakes from
+    /// the host side.
+    fn armed_waker() -> (&'static Waker, Arc<AtomicBool>) {
+        let flag = Arc::new(AtomicBool::new(false));
+        let waker: &'static Waker =
+            Box::leak(Box::new(Waker::from(Arc::new(TestWake(flag.clone())))));
+        (waker, flag)
+    }
+
+    /// See `crate::testing::RENDER`: Blitz paints (and the shared `COUNTER`)
+    /// must not run concurrently with other tests, so rendering tests hold this
+    /// guard for their whole body.
+    fn render_lock() -> std::sync::MutexGuard<'static, ()> {
+        crate::testing::RENDER.lock().unwrap()
+    }
+
+    const ANIM_CSS: &str = r#"
+        @keyframes opacity-pulse {
+            from { opacity: 1.0; }
+            to   { opacity: 0.2; }
+        }
+        .demo {
+            animation: opacity-pulse 1s linear infinite;
+        }
+    "#;
+
+    fn animated_app() -> Element {
+        rsx! {
+            div {
+                style: "width: 100%; height: 100%; background: #000;",
+                style { {ANIM_CSS} }
+                div {
+                    class: "demo",
+                    style: "width: 40px; height: 8px; background-color: #fff;",
+                }
+            }
+        }
+    }
+
+    const FINITE_CSS: &str = r#"
+        @keyframes fade-out {
+            from { opacity: 1.0; }
+            to   { opacity: 0.0; }
+        }
+        .fade {
+            animation: fade-out 200ms linear 1;
+        }
+    "#;
+
+    fn finite_animation_app() -> Element {
+        rsx! {
+            div {
+                style: "width: 100%; height: 100%; background: #000;",
+                style { {FINITE_CSS} }
+                div {
+                    class: "fade",
+                    style: "width: 40px; height: 8px; background-color: #fff;",
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_static_ui_renders_once_then_idles() {
+        let _guard = render_lock();
+        let config = Viewport {
+            width: 100,
+            height: 30,
+            scale_factor: 1.0,
+        };
+        let mut sys = TouchbardSystem::new(test_app, config);
+        assert!(sys.frame(None).is_some(), "initial state must render");
+        assert!(!sys.needs_redraw(), "static UI is not animating");
+        assert!(sys.frame(None).is_none(), "idle UI must not render frames");
+        assert!(
+            sys.frame(None).is_none(),
+            "stays idle after further requests"
+        );
+    }
+
+    /// A `run()`-style pre-render (no waker armed) must not steal the
+    /// backend's guaranteed first present: the first host-armed frame still
+    /// renders, and the app idles again afterwards.
+    #[test]
+    fn test_pre_render_does_not_steal_first_host_present() {
+        let _guard = render_lock();
+        let config = Viewport {
+            width: 100,
+            height: 30,
+            scale_factor: 1.0,
+        };
+        let mut sys = TouchbardSystem::new(test_app, config);
+        let (waker, _flag) = armed_waker();
+
+        // Equivalent of `run()`'s pre-render with no waker armed.
+        assert!(sys.frame(None).is_some(), "pre-render");
+        assert!(sys.frame(None).is_none(), "idle after the pre-render");
+
+        // The backend arms its waker: this must be its initial present.
+        assert!(
+            sys.frame(Some(waker)).is_some(),
+            "first host-armed frame must present after a pre-render"
+        );
+        assert!(
+            sys.frame(Some(waker)).is_none(),
+            "static app idles again after its initial present"
+        );
+    }
+
+    #[test]
+    fn test_pointer_hover_redraw_wakes_the_host() {
+        let _guard = render_lock();
+        let config = Viewport {
+            width: 100,
+            height: 30,
+            scale_factor: 1.0,
+        };
+        let mut sys = TouchbardSystem::new(test_app, config);
+        let (waker, flag) = armed_waker();
+
+        // Initial frame arms the host waker through the scheduler.
+        assert!(sys.frame(Some(waker)).is_some());
+        flag.store(false, Ordering::SeqCst);
+
+        // A move that changes the hovered element goes through Blitz's shell
+        // provider: the runtime must wake the host and remember the redraw.
+        sys.handle_pointer_event(UiPointerEvent {
+            x: 50.0,
+            y: 15.0,
+            button: PointerButton::Main,
+            buttons: 0,
+            kind: PointerEventKind::Move,
+        });
+        assert!(
+            flag.load(Ordering::SeqCst),
+            "hover change must wake the host"
+        );
+
+        // The requested redraw produces one frame, then the UI is idle again.
+        assert!(sys.frame(Some(waker)).is_some(), "requested redraw renders");
+        assert!(
+            sys.frame(Some(waker)).is_none(),
+            "redraw consumed; idle again"
+        );
+    }
+
+    #[test]
+    fn test_dioxus_state_change_wakes_the_host_and_frames() {
+        let _guard = render_lock();
+        COUNTER.store(0, Ordering::SeqCst);
+        let mut sys = TouchbardSystem::new(counter_app, preview_config());
+        let (waker, flag) = armed_waker();
+        assert!(sys.frame(Some(waker)).is_some(), "initial frame");
+        flag.store(false, Ordering::SeqCst);
+
+        // Real input through Blitz → Dioxus onclick → counter signal write.
+        // The Dioxus scheduler must wake the registered host waker.
+        for kind in [
+            PointerEventKind::Move,
+            PointerEventKind::Down,
+            PointerEventKind::Up,
+        ] {
+            sys.handle_pointer_event(UiPointerEvent {
+                x: 621.7,
+                y: 15.0,
+                button: PointerButton::Main,
+                buttons: if kind == PointerEventKind::Up { 0 } else { 1 },
+                kind,
+            });
+        }
+        assert!(
+            flag.load(Ordering::SeqCst),
+            "Dioxus wake must fire the host waker"
+        );
+        assert_eq!(COUNTER.load(Ordering::SeqCst), 1, "click landed");
+
+        // The next scheduling step poll pumps the mutation and renders.
+        assert!(sys.frame(Some(waker)).is_some(), "changed document renders");
+    }
+
+    #[test]
+    fn test_active_css_animation_drives_frames() {
+        let _guard = render_lock();
+        let config = Viewport {
+            width: 320,
+            height: 60,
+            scale_factor: 2.0,
+        };
+        let mut sys = TouchbardSystem::new(animated_app, config);
+        assert!(sys.frame(None).is_some(), "initial render");
+
+        std::thread::sleep(std::time::Duration::from_millis(60));
+        assert!(sys.needs_redraw(), "animation is active");
+        assert!(sys.frame(None).is_some(), "animation tick renders");
+
+        std::thread::sleep(std::time::Duration::from_millis(60));
+        assert!(sys.frame(None).is_some(), "animation keeps rendering");
+    }
+
+    #[test]
+    fn test_finished_css_animation_stops_repeated_frames() {
+        let _guard = render_lock();
+        let config = Viewport {
+            width: 320,
+            height: 60,
+            scale_factor: 2.0,
+        };
+        let mut sys = TouchbardSystem::new(finite_animation_app, config);
+        assert!(sys.frame(None).is_some(), "initial render");
+        assert!(sys.needs_redraw(), "one-shot animation is running");
+
+        // 600ms ≫ the 200ms animation; the frame that crosses the end renders
+        // the final state.
+        std::thread::sleep(std::time::Duration::from_millis(600));
+        assert!(sys.frame(None).is_some(), "final tick at animation end");
+
+        // The document is static again: no further frames.
+        assert!(!sys.needs_redraw(), "finished animation is not animating");
+        assert!(sys.frame(None).is_none(), "no frames after animation end");
+    }
+
     #[test]
     fn test_system_creation() {
         let config = Viewport {
@@ -268,6 +667,7 @@ mod tests {
 
     #[test]
     fn test_render_produces_frame() {
+        let _guard = render_lock();
         let config = Viewport {
             width: 100,
             height: 30,
@@ -283,6 +683,7 @@ mod tests {
 
     #[test]
     fn test_resize_affects_render() {
+        let _guard = render_lock();
         let config = Viewport {
             width: 100,
             height: 30,
@@ -304,6 +705,7 @@ mod tests {
     /// without a preceding move still targets the node under it.
     #[test]
     fn test_click_direction_and_stale_hover() {
+        let _guard = render_lock();
         COUNTER.store(0, Ordering::SeqCst);
 
         let mut sys = TouchbardSystem::new(counter_app, preview_config());

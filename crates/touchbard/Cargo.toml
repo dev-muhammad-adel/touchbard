@@ -19,3 +19,6 @@ tracing-subscriber = { workspace = true }
 
 [dev-dependencies]
 dioxus = { workspace = true }
+anyrender = { workspace = true }
+kurbo = "0.12"
+peniko = "0.5"

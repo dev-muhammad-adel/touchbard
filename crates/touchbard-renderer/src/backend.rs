@@ -37,9 +37,9 @@ impl Viewport {
 ///
 /// A backend owns everything specific to its output medium:
 /// - [`Backend::initialize`] discovers/probes its display (for the preview that
-///   is the configured/default framebuffer size; for DRM it will be the
-///   connected connector's mode) and returns the physical [`Viewport`] the UI
-///   system must be created at,
+///   is the configured/default framebuffer size; for DRM it is the connected
+///   connector's mode) and returns the physical [`Viewport`] the UI system must
+///   be created at,
 /// - [`Backend::run`] owns the backend's event loop and thread (e.g. a
 ///   current-thread Tokio runtime for the WebSocket preview), which feeds
 ///   pointer input into the runtime and presents the frames it produces.
@@ -49,12 +49,12 @@ impl Viewport {
 /// about a backend, and a backend knows nothing about Dioxus or Blitz.
 ///
 /// Lifecycle: `initialize` → create the UI system at the returned
-/// [`Viewport`] → `run`. Initialization failures (e.g. DRM not implemented)
-/// are propagated as errors, never panics and never fake viewports.
+/// [`Viewport`] → `run`. Initialization failures are propagated as errors,
+/// never panics and never fake viewports.
 ///
 /// Implemented by the concrete backend crates:
 /// - `touchbard-preview`: browser canvas over the WebSocket preview protocol,
-/// - `touchbard-drm`: DRM/KMS output (scaffolded, not yet implemented).
+/// - `touchbard-drm`: DRM/KMS output on the Touch Bar display.
 pub trait Backend {
     /// Initialize the backend, returning the physical [`Viewport`] the UI must
     /// target.
@@ -69,10 +69,12 @@ pub trait Backend {
     ///
     /// `source` is the shared [`FrameSource`] (`Rc<RefCell<_>>`) and must stay
     /// on the calling thread: Blitz documents are not `Send`, so the whole
-    /// pipeline runs single-threaded. The backend is responsible for presenting
-    /// frames from `source.poll_and_render()` and dispatching its input events
-    /// (converted to logical-pixel [`PointerEvent`](crate::PointerEvent)s) via
-    /// `source.handle_pointer_event()`.
+    /// pipeline runs single-threaded. The backend registers a single wake
+    /// primitive, blocks on it while the source has no work for it, calls
+    /// [`frame`](FrameSource::frame) on each wake, and presents the frames it
+    /// gets (dispatching input events — converted to logical-pixel
+    /// [`PointerEvent`](crate::PointerEvent)s — via
+    /// `source.handle_pointer_event()`).
     fn run(
         &mut self,
         source: Rc<RefCell<dyn FrameSource>>,
@@ -88,8 +90,12 @@ mod tests {
     impl FrameSource for DummySource {
         fn handle_pointer_event(&mut self, _event: crate::PointerEvent) {}
 
-        fn poll_and_render(&mut self) -> crate::Frame {
-            crate::Frame::new(0, 0, crate::PixelFormat::Rgba8)
+        fn frame(&mut self, _wake: Option<&'static std::task::Waker>) -> Option<crate::Frame> {
+            Some(crate::Frame::new(0, 0, crate::PixelFormat::Rgba8))
+        }
+
+        fn needs_redraw(&self) -> bool {
+            false
         }
     }
 

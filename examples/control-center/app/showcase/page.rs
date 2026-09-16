@@ -40,6 +40,11 @@ pub fn Page() -> Element {
                 title: "System",
                 hint: "pipeline · viewport · frame format · input events",
             }
+            Cat {
+                to: "/showcase/tiles",
+                title: "Tiles",
+                hint: "the preserved original playground home",
+            }
         }
     }
 }

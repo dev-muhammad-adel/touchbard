@@ -14,6 +14,16 @@
 //! font/layout contexts), so the whole pipeline must run on a single thread.
 //! Hence `Rc<RefCell<dyn FrameSource>>` and `spawn_local`, driven by a
 //! current-thread Tokio runtime + `LocalSet`.
+//!
+//! Known limitation with multiple connections: every connection drives the one
+//! shared runtime, which holds a single host waker — the last connection to
+//! arm it wins. Incoming events on one tab while another has the waker armed
+//! can wake the wrong connection, delaying that frame until the next wake it
+//! does receive (a keepalive tick, the 16 ms animation tick while animating,
+//! or its own input). The initial-present guarantee holds for the first
+//! connection. Single-tab use is the supported scenario, so the server accepts
+//! exactly one live preview client and rejects a second connection gracefully
+//! (WebSocket policy-close) instead of sharing the runtime between them.
 
 use crate::protocol::{self, Hello};
 use touchbard_renderer::{
@@ -21,14 +31,51 @@ use touchbard_renderer::{
 };
 
 use futures_util::{SinkExt, StreamExt};
+use std::cell::Cell;
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
+use std::sync::Arc;
+use std::task::{Wake, Waker};
+use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
+use tokio::sync::Notify;
+use tokio_tungstenite::tungstenite::protocol::CloseFrame;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::WebSocketStream;
 use tracing::{info, warn};
+
+/// RAII guard that decrements the active-client count when a connection drops.
+struct ActiveClientGuard(Rc<Cell<usize>>);
+
+impl Drop for ActiveClientGuard {
+    fn drop(&mut self) {
+        self.0.set(0);
+    }
+}
+
+/// Upper bound on the animation cadence (≈60 Hz): while the runtime reports it
+/// is animating, the connection loop asks for a frame every [`ANIM_TICK`]. Not
+/// a fixed render rate — an idle document blocks on the WebSocket/wake select.
+const ANIM_TICK: Duration = Duration::from_millis(16);
+
+/// The [`Wake`] that completes a connection's [`Notify`]: Dioxus scheduler
+/// wakeups and shell redraw requests unblock the connection's select loop so
+/// it can ask the runtime whether there is a frame to send.
+struct FrameWake {
+    notify: Notify,
+}
+
+impl Wake for FrameWake {
+    fn wake(self: Arc<Self>) {
+        self.notify.notify_waiters();
+    }
+
+    fn wake_by_ref(self: &Arc<Self>) {
+        self.notify.notify_waiters();
+    }
+}
 
 /// Static files served by the preview HTTP server, keyed by path.
 pub const INDEX_HTML: &str = include_str!("../../../preview/index.html");
@@ -38,8 +85,10 @@ pub const PREVIEW_JS: &str = include_str!("../../../preview/preview.js");
 pub const DEFAULT_WIDTH: u32 = 2008;
 /// Default framebuffer size (physical pixels) for the preview canvas.
 pub const DEFAULT_HEIGHT: u32 = 60;
-/// Default scale factor (physical pixels per logical pixel).
-pub const DEFAULT_SCALE: f64 = 2.0;
+/// Default bias: the `control-center` pages are authored at 2008×60 logical
+/// pixels (1:1 with the Touch Bar's native resolution), so the default is `1.0`.
+/// Raise it with `TOUCHBARD_SCALE` for a smaller CSS-pixel grid.
+pub const DEFAULT_SCALE: f64 = 1.0;
 /// Default bind address for the HTTP/WebSocket server.
 pub const DEFAULT_BIND_ADDR: &str = "127.0.0.1:8888";
 
@@ -218,11 +267,16 @@ async fn serve(
     let listener = tokio::net::TcpListener::bind(&config.bind_addr).await?;
     info!("Preview server listening on http://{}", config.bind_addr);
 
+    // Single-client server: at most one live preview connection at a time (see
+    // module docs). Later connections are rejected with a policy close.
+    let active_clients = Rc::new(Cell::new(0usize));
+
     loop {
         let (stream, addr) = listener.accept().await?;
         let source = Rc::clone(&source);
+        let active_clients = Rc::clone(&active_clients);
         tokio::task::spawn_local(async move {
-            if let Err(e) = handle_connection(stream, viewport, source).await {
+            if let Err(e) = handle_connection(stream, viewport, source, active_clients).await {
                 warn!("Connection {addr} error: {e}");
             }
         });
@@ -326,6 +380,7 @@ async fn handle_connection(
     mut stream: TcpStream,
     viewport: Viewport,
     source: Rc<RefCell<dyn FrameSource>>,
+    active_clients: Rc<Cell<usize>>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     stream.set_nodelay(true).ok();
 
@@ -395,6 +450,32 @@ async fn handle_connection(
 
     info!("WebSocket connection established");
 
+    // Single-client policy: the shared runtime holds exactly one host waker;
+    // a second live connection would steal wakes from the first. Reject extras
+    // with a clean protocol-close instead of sharing the runtime.
+    if active_clients.get() > 0 {
+        info!("Rejecting duplicate preview client (single-client server)");
+        let _ = ws
+            .send(Message::Close(Some(CloseFrame {
+                code: tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode::Policy,
+                reason: "only one preview client is supported".into(),
+            })))
+            .await;
+        return Ok(());
+    }
+    active_clients.set(1);
+    let _active_guard = ActiveClientGuard(active_clients);
+
+    // Host wake bridge: the runtime registers this waker on the Dioxus
+    // scheduler and the shell redraw bridge; either unblocks the select below
+    // so it asks the runtime for a frame. Dioxus needs a `&'static` waker, so
+    // one is leaked per connection (bounded: connections run for the process
+    // lifetime).
+    let frame_wake = Arc::new(FrameWake {
+        notify: Notify::new(),
+    });
+    let waker: &'static Waker = Box::leak(Box::new(Waker::from(Arc::clone(&frame_wake))));
+
     // Send HELLO with framebuffer dimensions (the authoritative viewport
     // discovered at backend initialization), then push the current frame so the
     // canvas shows content immediately on connect/reconnect.
@@ -408,13 +489,26 @@ async fn handle_connection(
         if ws.send(protocol::hello(&hello)).await.is_err() {
             return Ok(());
         }
-        let frame = source.borrow_mut().poll_and_render();
-        let _ = ws
-            .send(protocol::frame(frame.width, frame.height, &frame.data))
-            .await;
+        // Bind the frame to a local so the `RefMut` borrow drops before the
+        // await below; holding `source.borrow_mut()` across `ws.send().await`
+        // panics ("already borrowed") the moment a second connection tries to
+        // borrow the same shell (see frame()/waker scheduling docs).
+        let frame = source.borrow_mut().frame(Some(waker));
+        if let Some(frame) = frame {
+            let _ = ws
+                .send(protocol::frame(frame.width, frame.height, &frame.data))
+                .await;
+        }
     }
 
-    loop {
+    let mut close = false;
+    let mut last_ping = std::time::Instant::now();
+    while !close {
+        // The animation-tick branch is armed only while the document is
+        // animating; otherwise the connection blocks on input/wake/keepalive.
+        let animating = source.borrow().needs_redraw();
+
+        let wait_start = std::time::Instant::now();
         tokio::select! {
             msg = ws.next() => {
                 match msg {
@@ -435,21 +529,28 @@ async fn handle_connection(
                             let event = translate_input(&input, 0.0);
                             // Borrow-scope discipline: never hold a RefCell borrow
                             // across an await point.
-                            let frame = {
+                            {
                                 let mut source = source.borrow_mut();
                                 source.handle_pointer_event(event);
-                                source.poll_and_render()
-                            };
-                            let _ = ws
-                                .send(protocol::frame(frame.width, frame.height, &frame.data))
-                                .await;
+                            }
                         } else if text.trim() == "PING" {
                             let _ = ws.send(Message::Text("PONG".to_string().into())).await;
                         }
                     }
                     Some(Ok(Message::Binary(bytes))) => {
-                        // Reserved for future binary input encoding.
-                        info!("Received binary message of {} bytes", bytes.len());
+                        if let Some(reflected_ns) = protocol::parse_pong(&bytes) {
+                            // Client echoed our PING timestamp; the elapsed
+                            // wall time is the network round-trip.
+                            let rtt_us = nanos_now().saturating_sub(reflected_ns) / 1000;
+                            touchbard_renderer::diag::record(
+                                touchbard_renderer::diag::Ev::Pong { rtt_us },
+                            );
+                            if rtt_us > 1000 {
+                                info!("preview client round-trip {rtt_us}us");
+                            }
+                        } else {
+                            info!("Received binary message of {} bytes", bytes.len());
+                        }
                     }
                     Some(Ok(Message::Ping(_))) => {
                         let _ = ws.send(Message::Pong(Vec::new().into())).await;
@@ -457,14 +558,49 @@ async fn handle_connection(
                     Some(Ok(_)) => {}
                     Some(Err(e)) => {
                         warn!("WebSocket error: {e}");
-                        break;
+                        close = true;
                     }
-                    None => break,
+                    None => close = true,
                 }
             }
-            _ = tokio::time::sleep(std::time::Duration::from_secs(1)) => {
-                let _ = ws.send(protocol::ping(nanos_now())).await;
-            }
+            _ = frame_wake.notify.notified() => {}
+            _ = tokio::time::sleep(ANIM_TICK), if animating => {}
+        }
+
+        // Keepalive/RTT probe: the sleep-arm version above never fires while
+        // the animation tick keeps the select busy, so ping on a plain elapsed
+        // check instead. The browser echoes the timestamp in a binary PONG
+        // that is decoded in the `ws.next()` arm above.
+        if last_ping.elapsed() > Duration::from_secs(1) {
+            let _ = ws.send(protocol::ping(nanos_now())).await;
+            last_ping = std::time::Instant::now();
+        }
+
+        // The client is gone: drop out without the post-close best-effort
+        // frame send.
+        if close {
+            break;
+        }
+
+        // One scheduling decision per wake, whichever reason woke the select:
+        // present a frame only when the runtime says there is something new.
+        touchbard_renderer::diag::record(touchbard_renderer::diag::Ev::Wait {
+            wait_us: wait_start.elapsed().as_micros() as u64,
+        });
+        // Bind the frame to a local so the `RefMut` borrow drops before the
+        // await below; holding `source.borrow_mut()` across `ws.send().await`
+        // panics ("already borrowed") the moment a second connection tries to
+        // borrow the same shell.
+        let frame = source.borrow_mut().frame(Some(waker));
+        if let Some(frame) = frame {
+            touchbard_renderer::diag::record(touchbard_renderer::diag::Ev::SendStart);
+            let present_start = std::time::Instant::now();
+            let _ = ws
+                .send(protocol::frame(frame.width, frame.height, &frame.data))
+                .await;
+            touchbard_renderer::diag::record(touchbard_renderer::diag::Ev::Present {
+                present_us: present_start.elapsed().as_micros() as u64,
+            });
         }
     }
 
@@ -527,12 +663,12 @@ mod tests {
         let config = PreviewConfig::default();
         assert_eq!(config.width, 2008);
         assert_eq!(config.height, 60);
-        assert_eq!(config.scale_factor, 2.0);
+        assert_eq!(config.scale_factor, 1.0);
         assert_eq!(config.bind_addr, "127.0.0.1:8888");
     }
 
     /// Backend initialization must provide the configured/default viewport:
-    /// 2008×60 @ 2.0 with no overrides.
+    /// 2008×60 @ 1.0 with no overrides.
     #[test]
     fn test_preview_backend_initialize_default_viewport() {
         let mut backend = PreviewBackend::new();
@@ -541,7 +677,7 @@ mod tests {
             .expect("preview initialization is infallible");
         assert_eq!(viewport.width, 2008);
         assert_eq!(viewport.height, 60);
-        assert_eq!(viewport.scale_factor, 2.0);
+        assert_eq!(viewport.scale_factor, 1.0);
     }
 
     /// Backend initialization must follow the configuration: a custom
@@ -589,5 +725,202 @@ mod tests {
         assert_eq!(ev.kind, PointerEventKind::Down);
         assert_eq!(ev.button, PointerButton::Main);
         assert_eq!(ev.buttons, 1);
+    }
+}
+
+#[cfg(test)]
+mod ws_integration_tests {
+    use super::*;
+    use crate::protocol::MsgType;
+    use dioxus::prelude::*;
+    use tokio_tungstenite::connect_async;
+    use touchbard::TouchbardSystem;
+
+    const ANIM_CSS: &str = r#"
+        @keyframes preview-demo {
+            from { opacity: 1.0; }
+            to   { opacity: 0.2; }
+        }
+        .preview-demo {
+            animation: preview-demo 1s linear infinite;
+        }
+    "#;
+
+    fn animated_app() -> Element {
+        rsx! {
+            div {
+                style: "width: 100%; height: 100%; background: #000;",
+                style { {ANIM_CSS} }
+                div {
+                    class: "preview-demo",
+                    style: "width: 40px; height: 8px; background-color: #fff;",
+                }
+            }
+        }
+    }
+
+    /// The server must keep producing frames without any input while the
+    /// document is animating (the old loop only rendered when an input message
+    /// arrived, which froze CSS animations in the browser).
+    #[test]
+    fn preview_advances_animations_without_input() {
+        let viewport = Viewport {
+            width: 160,
+            height: 60,
+            scale_factor: 2.0,
+        };
+        let source: Rc<RefCell<dyn FrameSource>> =
+            Rc::new(RefCell::new(TouchbardSystem::new(animated_app, viewport)));
+
+        let local = tokio::task::LocalSet::new();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("current-thread runtime");
+
+        local.block_on(&runtime, async {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("bind");
+            let addr = listener.local_addr().expect("local addr");
+
+            let server_source = Rc::clone(&source);
+            let server_viewport = viewport;
+            let active_clients = Rc::new(Cell::new(0usize));
+            local.spawn_local(async move {
+                let (stream, _) = listener.accept().await.expect("accept");
+                handle_connection(stream, server_viewport, server_source, active_clients)
+                    .await
+                    .expect("connection handled");
+            });
+
+            // Let the server arm its accept before the client connects.
+            tokio::task::yield_now().await;
+
+            let (mut ws, _) = connect_async(format!("ws://{addr}/ws"))
+                .await
+                .expect("websocket upgrade");
+
+            // No input is sent. The document animates forever, so the server
+            // must keep streaming frames on its own.
+            let mut frames = 0u32;
+            let deadline = tokio::time::sleep(Duration::from_millis(800));
+            tokio::pin!(deadline);
+            loop {
+                tokio::select! {
+                    msg = ws.next() => match msg {
+                        Some(Ok(Message::Binary(bytes))) => {
+                            if bytes.first() == Some(&(MsgType::Frame as u8)) {
+                                frames += 1;
+                                if frames >= 3 {
+                                    break;
+                                }
+                            }
+                        }
+                        Some(Ok(_)) => {}
+                        Some(Err(e)) => panic!("ws error: {e}"),
+                        None => panic!("connection closed unexpectedly"),
+                    },
+                    _ = &mut deadline => break,
+                }
+            }
+            assert!(
+                frames >= 3,
+                "animated preview must stream frames without input; got {frames}"
+            );
+        });
+    }
+
+    /// The server supports exactly one live preview client: a second connection
+    /// must be rejected with a clean policy close (not a panic). Regression for
+    /// the duplicate-connection crash caused by holding a `RefCell` borrow
+    /// across `ws.send(...).await` while a second connection borrowed the same
+    /// shell.
+    #[test]
+    fn duplicate_connection_is_rejected_with_policy_close() {
+        let viewport = Viewport {
+            width: 160,
+            height: 60,
+            scale_factor: 2.0,
+        };
+        let source: Rc<RefCell<dyn FrameSource>> =
+            Rc::new(RefCell::new(TouchbardSystem::new(animated_app, viewport)));
+
+        let local = tokio::task::LocalSet::new();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("current-thread runtime");
+
+        local.block_on(&runtime, async {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("bind");
+            let addr = listener.local_addr().expect("local addr");
+
+            let server_source = Rc::clone(&source);
+            let server_viewport = viewport;
+            let active_clients = Rc::new(Cell::new(0usize));
+            local.spawn_local(async move {
+                for _ in 0..2 {
+                    let (stream, _) = listener.accept().await.expect("accept");
+                    let source = Rc::clone(&server_source);
+                    let active = Rc::clone(&active_clients);
+                    tokio::task::spawn_local(async move {
+                        let _ = handle_connection(stream, server_viewport, source, active).await;
+                    });
+                }
+            });
+
+            // Let the server arm its accept before the clients connect.
+            tokio::task::yield_now().await;
+
+            let (mut first, _) = connect_async(format!("ws://{addr}/ws"))
+                .await
+                .expect("first websocket upgrade");
+            tokio::task::yield_now().await;
+
+            let (mut second, _) = connect_async(format!("ws://{addr}/ws"))
+                .await
+                .expect("second websocket upgrade");
+
+            // The second connection must receive the policy close (and the
+            // first must keep streaming frames, i.e. the guard freed the shell
+            // for the first client).
+            let deadline = tokio::time::sleep(Duration::from_millis(500));
+            tokio::pin!(deadline);
+            loop {
+                tokio::select! {
+                    msg = second.next() => match msg {
+                        Some(Ok(Message::Close(_frame))) => break,
+                        Some(Ok(Message::Binary(bytes))) if bytes.first() == Some(&(MsgType::Frame as u8)) => continue,
+                        Some(Ok(_)) => {}
+                        Some(Err(e)) => panic!("second ws unexpected error: {e}"),
+                        None => panic!("second ws closed without a policy frame"),
+                    },
+                    _ = &mut deadline => panic!("second connection was not rejected"),
+                }
+            }
+
+            // The first connection must still be usable (frames flowing).
+            let mut frames = 0u32;
+            let deadline = tokio::time::sleep(Duration::from_millis(500));
+            tokio::pin!(deadline);
+            loop {
+                tokio::select! {
+                    msg = first.next() => match msg {
+                        Some(Ok(Message::Binary(bytes))) if bytes.first() == Some(&(MsgType::Frame as u8)) => {
+                            frames += 1;
+                            if frames >= 2 { break; }
+                        }
+                        Some(Ok(_)) => {}
+                        Some(Err(e)) => panic!("first ws error: {e}"),
+                        None => panic!("first ws closed unexpectedly"),
+                    },
+                    _ = &mut deadline => break,
+                }
+            }
+            assert!(frames >= 2, "first client must keep receiving frames; got {frames}");
+        });
     }
 }

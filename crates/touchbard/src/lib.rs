@@ -16,9 +16,9 @@
 //! Frame (premultiplied RGBA framebuffer)
 //! ```
 //!
-//! #[`run`] performs the backend lifecycle: it initializes the backend (which
+//! [`run()`] performs the backend lifecycle: it initializes the backend (which
 //! discovers/provides the authoritative physical viewport), creates the
-//! [`TouchbardSystem`](system::TouchbardSystem) at that viewport, then hands
+//! [`TouchbardSystem`] at that viewport, then hands
 //! control to the backend, which owns its own event loop and presentation.
 //! The backend boundary types ([`Frame`], [`PointerEvent`], [`Viewport`],
 //! [`FrameSource`], [`Backend`]) live in `touchbard-renderer` and are
@@ -39,3 +39,21 @@ pub use touchbard_renderer::{
     Backend, Frame, FrameSource, PixelFormat, PointerButton, PointerEvent, PointerEventKind,
     Viewport,
 };
+
+/// Test-only support shared across this crate's test modules.
+#[cfg(test)]
+mod testing {
+    use std::sync::Mutex;
+
+    /// Serializes Blitz rendering across this crate's tests.
+    ///
+    /// `blitz-paint` draws through process-global layer/opacity statics that are
+    /// not safe to interleave across threads (a concurrent frame can leave
+    /// them unbalanced and later frames can overflow). Tests that push frames
+    /// through [`TouchbardSystem`](crate::TouchbardSystem) - and input tests
+    /// that share process-global signal counters with the render tests - hold
+    /// this lock for their whole body so they run one at a time. The test
+    /// harness alone guarantees nothing about ordering, so this is the only way
+    /// to keep the shared statics balanced.
+    pub(crate) static RENDER: Mutex<()> = Mutex::new(());
+}

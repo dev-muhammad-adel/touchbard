@@ -60,3 +60,8 @@ serde_json = "1"
 # WebSocket handshake helpers
 base64 = "0.22"
 sha1 = "0.10"
+
+# Vended fork of blitz-paint 0.2.1: fixes NaN border-edge geometry for
+# zero-width borders (see crates/blitz-paint).
+[patch.crates-io]
+blitz-paint = { path = "crates/blitz-paint" }

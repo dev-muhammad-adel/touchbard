@@ -26,6 +26,42 @@ let frameHeight = 0;
 let scaleFactor = 1.0;
 let reconnecting = false;
 
+// ---- Optional frame-timing metering (?diag=1) -----------------------------
+// Shows browser-observed cadence: WebSocket arrival interval, the per-frame
+// unpremultiply/putImageData cost, and the rAF (vsync) tick cadence. Enabled
+// only on demand so the normal preview path keeps zero overhead.
+const DIAG = new URLSearchParams(location.search).has("diag");
+const diagEl = DIAG ? document.getElementById("diaghud") : null;
+const arrTimes = []; // perf.now() at each FRAME receive (last ~120)
+const decodeUs = []; // ms spent preparing + putting each frame
+const rafDeltas = []; // ms between consecutive rAF callbacks (last ~120)
+if (DIAG) {
+  diagEl.hidden = false;
+  const k = { last: performance.now() };
+  const tick = (t) => {
+    rafDeltas.push(t - k.last);
+    if (rafDeltas.length > 120) rafDeltas.shift();
+    k.last = t;
+    requestAnimationFrame(tick);
+  };
+  requestAnimationFrame(tick);
+  setInterval(() => {
+    while (arrTimes.length > 120) arrTimes.shift();
+    const iv = arrTimes.length >= 2 ? arrTimes.slice(1).map((t, i) => t - arrTimes[i]) : [];
+    const rAF = rafDeltas.filter((d) => d > 5); // ignore tab-switch stalls
+    const avg = (xs) => (xs.length ? xs.reduce((a, b) => a + b, 0) / xs.length : 0);
+    const pct = (xs, q) => {
+      const s = [...xs].sort((a, b) => a - b);
+      return s.length ? s[Math.min(s.length - 1, Math.floor((s.length - 1) * q))] : 0;
+    };
+    const fps = iv.length ? 1000 / avg(iv) : 0;
+    const dec = decodeUs.length ? avg(decodeUs) : 0;
+    diagEl.textContent =
+      `fps ${fps.toFixed(1)} · arrive ${avg(iv).toFixed(1)}(p99 ${pct(iv, 0.99).toFixed(1)})ms · ` +
+      `decode ${dec.toFixed(2)}ms · rAF ${avg(rAF).toFixed(2)}ms`;
+  }, 500);
+}
+
 function connect() {
   const proto = location.protocol === "https:" ? "wss" : "ws";
   ws = new WebSocket(`${proto}://${location.host}/ws`);
@@ -100,6 +136,8 @@ function handleBinary(bytes) {
   const type = bytes[0];
   switch (type) {
     case MSG.FRAME: {
+      if (DIAG) arrTimes.push(performance.now());
+      const decodeStart = performance.now();
       const width = readU32(bytes, 1);
       const height = readU32(bytes, 5);
       const pixels = bytes.subarray(9);
@@ -124,6 +162,10 @@ function handleBinary(bytes) {
         }
       }
       ctx.putImageData(imageData, 0, 0);
+      if (DIAG) {
+        decodeUs.push(performance.now() - decodeStart);
+        if (decodeUs.length > 120) decodeUs.shift();
+      }
       break;
     }
     case MSG.RAW_FRAME: {

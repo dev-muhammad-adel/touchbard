@@ -11,7 +11,7 @@
 //! * The generated router component — produced by the [`app_router!`]
 //!   proc-macro. The macro is an *expression* that expands to the root router
 //!   component (`fn() -> Element`), so apps pass it straight to
-//!   [`touchbard::run`](crate::run):
+//!   [`touchbard::run`](crate::run()):
 //!
 //!   ```text
 //!   touchbard::run(touchbard::routing::app_router!(), TouchbardConfig { backend })
@@ -49,7 +49,7 @@
 pub mod core;
 pub mod hooks;
 
-pub use core::{Navigation, Navigator, RouteParams, split_path};
+pub use core::{split_path, Navigation, Navigator, RouteParams};
 pub use hooks::{use_navigate, use_route, use_route_param, use_route_params};
 
 /// Re-export of the build-time routing macro (defined in `touchbard-macros`).

@@ -3,8 +3,7 @@
 //! This crate owns:
 //! - the concrete CPU rendering pipeline ([`cpu`]) used by all display backends,
 //! - the framebuffer ([`Frame`]) and pointer-input ([`PointerEvent`]) types that
-//!   form the backend boundary (the WebSocket preview consumes them now; DRM/KMS
-//!   will consume the same),
+//!   form the backend boundary (consumed by the WebSocket preview and DRM/KMS),
 //! - the [`Viewport`] type backends produce at initialization and the runtime
 //!   creates the UI at,
 //! - the [`FrameSource`] trait backends use to drive a runtime without knowing
@@ -14,6 +13,7 @@
 
 pub mod backend;
 pub mod cpu;
+pub mod diag;
 pub mod events;
 pub mod frame;
 pub mod frame_source;

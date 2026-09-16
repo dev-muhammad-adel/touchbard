@@ -12,14 +12,14 @@ Dioxus VirtualDom
     → AnyRender scene
     → Vello CPU rasterization
     → Frame (premultiplied RGBA8 framebuffer)
-    → backend (WebSocket preview now, DRM/KMS later)
+    → backend (WebSocket preview, DRM/KMS)
 ```
 
 ## Quick start
 
 ```text
 cargo run --example control-center -- --preview    # browser preview (default)
-cargo run --example control-center -- --drm        # not implemented yet
+cargo run --example control-center -- --drm        # physical Touch Bar
 ```
 
 The example is deliberately thin: an app component, CLI parsing, backend
@@ -57,10 +57,12 @@ configured/default viewport (2008×60 @ 2.0 by default).
 
 ### `DrmConfig` / `DrmBackend` (touchbard-drm)
 
-Deliberately minimal: no width/height/scale/bind, because DRM dimensions will
-come from the display connector at runtime. `DrmBackend` implements
-[`Backend`] and its `initialize` always returns a clean "not implemented"
-error (no fake viewport).
+No width/height/scale/bind: DRM dimensions come from the connected display
+connector at runtime (2008×60 landscape on the Touch Bar, with the physical
+panel transpose handled internally). `DrmBackend` implements [`Backend`]:
+`initialize` runs discovery → open → resources → modeset and returns the
+physical viewport, `run` presents CPU-rendered frames through the scanout loop.
+`--drm` selects it.
 
 ## Backend lifecycle
 
@@ -72,9 +74,9 @@ backend.initialize()   →  authoritative Viewport   →  TouchbardSystem  →  
         (discover/probe/configure the display)      (created at that viewport)  (presents frames + input)
 ```
 
-`Backend::initialize` may fail cleanly (e.g. DRM not implemented yet); the
-runtime reports that as a backend-initialization error and never creates a UI
-system or fabricate a viewport.
+`Backend::initialize` may fail cleanly; the runtime reports that as a
+backend-initialization error and never creates a UI system or fabricate a
+viewport.
 
 ## Architecture and dependency direction
 
@@ -94,10 +96,16 @@ into a `Box<dyn Backend>` and handed to the runtime.
 
 The two key boundary traits live in `touchbard-renderer`:
 
-- **`FrameSource`** (the app/runtime side): `handle_pointer_event`,
-  `poll_and_render`. Implemented by `TouchbardSystem` and consumed by backends.
+- **`FrameSource`** (the app/runtime side): `handle_pointer_event`, `frame`,
+  `needs_redraw`. Implemented by `TouchbardSystem` and consumed by backends.
   It is exclusively about the rendered UI/frame side - it does not expose
-  physical display properties.
+  physical display properties. Frame production is event-driven: `frame` returns
+  `Some(Frame)` only when the document changed, requested a redraw, or is
+  animating; a backend blocks on its own wake (DRM eventfd / preview async
+  select) while `None`, and bounds its wait (~60 Hz upper bound) only while
+  `needs_redraw` is true. A backend that arms its host waker is guaranteed at
+  least one frame (its initial present), even if the runtime already pre-rendered
+  a frame with no waker armed.
 - **`Backend`** (the output/display side): `initialize` → [`Viewport`], `run`.
   Implemented by `PreviewBackend` and `DrmBackend` and consumed by the runtime.
 
@@ -113,14 +121,14 @@ no other accessor exposes a copy.
 | `touchbard`           | Public API (`run`, config, system), Dioxus+Blitz document, input dispatch       |
 | `touchbard-renderer`  | Boundary types `Frame`/`PointerEvent`, `FrameSource`/`Backend` traits, CPU renderer |
 | `touchbard-preview`   | [`PreviewBackend`], WebSocket server, `PreviewConfig`, binary protocol (v1)     |
-| `touchbard-drm`       | [`DrmBackend`] scaffold + `DrmConfig` only                                     |
+| `touchbard-drm`       | [`DrmBackend`]: discovery, USB preparation, KMS resources, modeset, CPU scanout |
 
 The whole pipeline is single-threaded (Blitz documents are not `Send`). Each
 backend owns its own runtime: the preview backend builds a current-thread Tokio
 runtime + `LocalSet` inside its own `Backend::run` method. The core runtime
 (`touchbard::run`) initializes the backend (getting the authoritative viewport),
-creates the `TouchbardSystem` at that viewport, renders once to prove the
-pipeline works, then hands control to the backend.
+creates the `TouchbardSystem` at that viewport, renders one frame up front so the
+initial render log carries real data, then hands control to the backend.
 
 ## Frame pixel format
 

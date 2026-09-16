@@ -144,7 +144,9 @@ fn module_ident(s: &str, ctx: &str) -> Result<String, String> {
         return Err(format!("{ctx}: empty name"));
     }
     if is_keyword(s) {
-        return Err(format!("{ctx}: `{s}` is a Rust keyword, not a usable module name"));
+        return Err(format!(
+            "{ctx}: `{s}` is a Rust keyword, not a usable module name"
+        ));
     }
     for (i, c) in s.chars().enumerate() {
         if i == 0 {
@@ -335,7 +337,9 @@ enum Classified {
 
 fn classify_dir(name: &str) -> Result<Classified, String> {
     if name.starts_with("[[") && name.ends_with("]]") {
-        return Ok(Classified::OptionalCatch(name[2..name.len() - 2].to_string()));
+        return Ok(Classified::OptionalCatch(
+            name[2..name.len() - 2].to_string(),
+        ));
     }
     if name.starts_with('[') && name.ends_with(']') {
         let inner = &name[1..name.len() - 1];
@@ -586,7 +590,7 @@ fn set_once(slot: &mut Option<PathBuf>, path: PathBuf, name: &str) -> Result<(),
 
 struct Route {
     id: proc_macro2::Ident,
-    page_mods: Vec<String>, // module path to the module containing `Page`
+    page_mods: Vec<String>,    // module path to the module containing `Page`
     layouts: Vec<Vec<String>>, // ancestor layout module paths, root -> leaf
 }
 
@@ -656,7 +660,8 @@ fn collect(node: &Node, layouts_so_far: &[Vec<String>], gen: &mut Gen) -> Result
             });
             // `child.module_path` already names the leaf module for this file
             // (segment stem); register the include at that path.
-            gen.mod_paths.push((child.module_path.clone(), file.clone()));
+            gen.mod_paths
+                .push((child.module_path.clone(), file.clone()));
         } else {
             collect(child, &chain, gen)?;
         }
@@ -1016,11 +1021,7 @@ fn candidate_bases(manifest: &Path, bin_name: Option<&str>) -> Vec<PathBuf> {
 /// Resolve `<rel>` relative to the invoking source file: the first existing
 /// directory among `<manifest>/examples/<bin>/<rel>` (when `bin_name` is given)
 /// and `<manifest>/<rel>` wins.
-fn resolve_app_root(
-    manifest: &Path,
-    bin_name: Option<&str>,
-    rel: &str,
-) -> Result<PathBuf, String> {
+fn resolve_app_root(manifest: &Path, bin_name: Option<&str>, rel: &str) -> Result<PathBuf, String> {
     let candidates: Vec<PathBuf> = candidate_bases(manifest, bin_name)
         .into_iter()
         .map(|base| base.join(rel))
@@ -1129,7 +1130,10 @@ fn generate(app_root: &Path) -> Result<Tokens2, String> {
         "div { style: \"padding: 4px 8px; color: #b4befe;\", \"Page not found\" }".to_string()
     };
     let nf_chain = wrap_layouts(&nf_content, &gen.root_layouts);
-    let nf_body = parse_tokens(&format!("rsx! {{ {} }}", wrap_error_loading(nf_chain, &specials)));
+    let nf_body = parse_tokens(&format!(
+        "rsx! {{ {} }}",
+        wrap_error_loading(nf_chain, &specials)
+    ));
     let notfound_arm = quote!(__RouteId::__NotFound => { #nf_body },);
 
     let mods = emit_mod_tree(&mod_tree);
@@ -1300,10 +1304,22 @@ mod tests {
 
         // The group's route is hoisted into the level-0 matcher under its own
         // URL segment, with no `(admin)` segment anywhere.
-        assert!(out.contains("__m___group_admin_dashboard"), "hoisted leaf fn: {out}");
-        assert!(out.contains("\"dashboard\""), "static arm for /dashboard: {out}");
-        assert!(!out.contains("\"admin\""), "no arm for the transparent group: {out}");
-        assert!(out.contains("AdminDashboardPage"), "id from URL-visible segments: {out}");
+        assert!(
+            out.contains("__m___group_admin_dashboard"),
+            "hoisted leaf fn: {out}"
+        );
+        assert!(
+            out.contains("\"dashboard\""),
+            "static arm for /dashboard: {out}"
+        );
+        assert!(
+            !out.contains("\"admin\""),
+            "no arm for the transparent group: {out}"
+        );
+        assert!(
+            out.contains("AdminDashboardPage"),
+            "id from URL-visible segments: {out}"
+        );
     }
 
     #[test]
@@ -1315,15 +1331,24 @@ mod tests {
         touch(&s.0, "(admin)/dashboard.rs");
 
         let out = gen(&s.0);
-        assert!(out.contains("\"dashboard\""), "dashboard is still a route: {out}");
+        assert!(
+            out.contains("\"dashboard\""),
+            "dashboard is still a route: {out}"
+        );
         assert!(!out.contains("\"admin\""), "no admin URL segment: {out}");
 
         // Dashboard must be wrapped by the *group* layout, which itself sits
         // inside the root layout: root :: group :: page, in that order.
         let group_wrap = "__group_admin :: layout :: Layout";
-        assert!(out.contains(group_wrap), "group layout in generated tree: {out}");
+        assert!(
+            out.contains(group_wrap),
+            "group layout in generated tree: {out}"
+        );
         let inner = format!("{group_wrap} {{ __group_admin :: dashboard :: Page");
-        assert!(out.contains(&inner), "group layout wraps only group pages: {out}");
+        assert!(
+            out.contains(&inner),
+            "group layout wraps only group pages: {out}"
+        );
         assert!(
             out.contains("layout :: Layout { __group_admin :: layout :: Layout"),
             "root layout sits outside the group layout: {out}"
@@ -1336,11 +1361,20 @@ mod tests {
         touch(&s.0, "(a)/(b)/dashboard.rs");
 
         let out = gen(&s.0);
-        assert!(out.contains("__m___group_a___group_b_dashboard"), "nested hoist: {out}");
-        assert!(out.contains("\"dashboard\""), "static arm for /dashboard: {out}");
+        assert!(
+            out.contains("__m___group_a___group_b_dashboard"),
+            "nested hoist: {out}"
+        );
+        assert!(
+            out.contains("\"dashboard\""),
+            "static arm for /dashboard: {out}"
+        );
         assert!(!out.contains("\"a\""), "no arm for (a): {out}");
         assert!(!out.contains("\"b\""), "no arm for (b): {out}");
-        assert!(out.contains("ABDashboardPage"), "id from the URL-visible segment: {out}");
+        assert!(
+            out.contains("ABDashboardPage"),
+            "id from the URL-visible segment: {out}"
+        );
     }
 
     #[test]
@@ -1349,13 +1383,19 @@ mod tests {
         touch(&s.0, "(admin)/[id]/page.rs");
 
         let out = gen(&s.0);
-        assert!(out.contains("__m___group_admin___param_id"), "dynamic inside group: {out}");
+        assert!(
+            out.contains("__m___group_admin___param_id"),
+            "dynamic inside group: {out}"
+        );
         assert!(
             out.contains("\"id\"") && out.contains("segs [0] . to_owned ()"),
             "dynamic param extracted from the first segment: {out}"
         );
         assert!(!out.contains("\"admin\""), "no admin URL segment: {out}");
-        assert!(out.contains("AdminIdParamPage"), "id includes the param: {out}");
+        assert!(
+            out.contains("AdminIdParamPage"),
+            "id includes the param: {out}"
+        );
     }
 
     #[test]
@@ -1364,13 +1404,19 @@ mod tests {
         touch(&s.0, "(admin)/[...slug]/page.rs");
 
         let out = gen(&s.0);
-        assert!(out.contains("__m___group_admin___catch_slug"), "catch-all inside group: {out}");
+        assert!(
+            out.contains("__m___group_admin___catch_slug"),
+            "catch-all inside group: {out}"
+        );
         assert!(
             out.contains("\"slug\"") && out.contains("segs . join (\"/\")"),
             "catch-all joined from the remaining segments: {out}"
         );
         assert!(!out.contains("\"admin\""), "no admin URL segment: {out}");
-        assert!(out.contains("AdminSlugCatchPage"), "id includes the catch-all: {out}");
+        assert!(
+            out.contains("AdminSlugCatchPage"),
+            "id includes the catch-all: {out}"
+        );
     }
 
     #[test]
@@ -1417,7 +1463,10 @@ mod tests {
 
         // Expression macro: the whole expansion is a block whose value is the
         // generated root component (fn item, coercible to `fn() -> Element`).
-        assert!(trimmed.starts_with('{'), "expansion is a block expression: {out}");
+        assert!(
+            trimmed.starts_with('{'),
+            "expansion is a block expression: {out}"
+        );
         assert!(
             trimmed.ends_with("___touchbard_app_router :: Router }"),
             "block tail evaluates to the private router fn: {out}"

@@ -1,9 +1,7 @@
 //! Input boundary types shared with every backend (preview WebSocket, touch
-//! device, future DRM), plus conversion to Blitz `UiEvent`s.
+//! device, DRM), plus conversion to Blitz `UiEvent`s.
 
-use blitz_traits::events::{
-    BlitzMouseButtonEvent, MouseEventButton, MouseEventButtons, UiEvent,
-};
+use blitz_traits::events::{BlitzMouseButtonEvent, MouseEventButton, MouseEventButtons, UiEvent};
 use keyboard_types::Modifiers;
 
 /// Pointer buttons, matching the browser/Blitz button numbering.
@@ -65,7 +63,11 @@ impl PointerEvent {
         MouseEventButtons::from_bits_retain(self.buttons)
     }
 
-    fn to_blitz_mouse_event(&self, button: MouseEventButton, buttons: MouseEventButtons) -> BlitzMouseButtonEvent {
+    fn to_blitz_mouse_event(
+        &self,
+        button: MouseEventButton,
+        buttons: MouseEventButtons,
+    ) -> BlitzMouseButtonEvent {
         BlitzMouseButtonEvent {
             x: self.x,
             y: self.y,

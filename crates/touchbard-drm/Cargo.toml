@@ -2,7 +2,9 @@
 name = "touchbard-drm"
 version = "0.1.0"
 edition = "2021"
-description = "DRM/KMS backend for Touchbar display (scaffolded, not yet implemented)"
+description = "DRM/KMS backend for the Touch Bar display: discovery, USB preparation, KMS resources, modeset, and CPU scanout"
 
 [dependencies]
+drm = "0.15"
+libc = "0.2"
 touchbard-renderer = { path = "../touchbard-renderer" }

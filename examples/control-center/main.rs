@@ -11,14 +11,14 @@
 //! argument — no separate `Router` symbol is needed.
 //!
 //! The display backend is selected here (the entry crate): the browser preview
-//! (`touchbard-preview`) or the DRM/KMS scaffold (`touchbard-drm`), both boxed
+//! (`touchbard-preview`) or the DRM/KMS backend (`touchbard-drm`), both boxed
 //! behind the [`touchbard::Backend`] boundary so the runtime stays independent
 //! of them.
 //!
 //! Run:
 //! ```text
 //! cargo run --example control-center -- --preview   # default
-//! cargo run --example control-center -- --drm       # not implemented yet
+//! cargo run --example control-center -- --drm       # the DRM/KMS backend (the Touch Bar itself)
 //! ```
 //!
 //! Preview dimensions come from `TOUCHBARD_WIDTH`, `TOUCHBARD_HEIGHT` and
@@ -40,7 +40,7 @@ fn main() {
     }
 
     let backend: Box<dyn Backend> = if args.iter().any(|a| a == "--drm") {
-        Box::new(DrmBackend::new(DrmConfig))
+        Box::new(DrmBackend::new(DrmConfig::default()))
     } else {
         Box::new(PreviewBackend::from_env())
     };

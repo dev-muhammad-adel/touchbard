@@ -49,5 +49,7 @@ pub fn use_route_param<T>(key: &str) -> Option<T>
 where
     T: FromStr + 'static,
 {
-    (navigation().params)().get(key).and_then(|v| v.parse().ok())
+    (navigation().params)()
+        .get(key)
+        .and_then(|v| v.parse().ok())
 }
