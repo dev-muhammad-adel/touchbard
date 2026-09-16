@@ -31,6 +31,19 @@ pub fn paint_scene(
     width: u32,
     height: u32,
 ) {
+    paint_scene_at(scene, dom, scale, width, height, None);
+}
+
+/// Paint the document while optionally carrying the animation clock into the
+/// temporary ball-position diagnostic.
+pub fn paint_scene_at(
+    scene: &mut impl PaintScene,
+    dom: &BaseDocument,
+    scale: f64,
+    width: u32,
+    height: u32,
+    animation_time: Option<f64>,
+) {
     reset_layer_stats();
 
     let devtools = *dom.devtools();
@@ -40,6 +53,8 @@ pub fn paint_scene(
         width,
         height,
         devtools,
+        animation_time,
+        trace_ball: std::env::var_os("TOUCHBARD_BALL_TRACE").is_some(),
     };
     generator.paint_scene(scene);
 

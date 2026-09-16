@@ -53,6 +53,38 @@ impl CpuRenderer {
         let mut frame = Frame::new(width, height, self.format);
         let paint_start = std::time::Instant::now();
         self.renderer.render(paint, &mut frame.data);
+        if std::env::var_os("TOUCHBARD_RASTER_TRACE").is_some() {
+            let mut weighted_x = 0.0_f64;
+            let mut weight_total = 0.0_f64;
+            let mut matching = 0_u64;
+            for y in 0..frame.height {
+                for x in 0..frame.width {
+                    let offset = y as usize * frame.stride + x as usize * 4;
+                    let r = frame.data[offset] as f64;
+                    let g = frame.data[offset + 1] as f64;
+                    let b = frame.data[offset + 2] as f64;
+                    let weight = (b - r).max(0.0) + (g - r).max(0.0) * 0.25;
+                    if weight > 20.0 {
+                        weighted_x += x as f64 * weight;
+                        weight_total += weight;
+                        matching += 1;
+                    }
+                }
+            }
+            let centroid_x = if weight_total > 0.0 {
+                weighted_x / weight_total
+            } else {
+                f64::NAN
+            };
+            let wall_us = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_micros())
+                .unwrap_or_default();
+            eprintln!(
+                "RASTER_TRACE wall_us={} centroid_x={:.6} matching_pixels={} weight={:.3}",
+                wall_us, centroid_x, matching, weight_total
+            );
+        }
         crate::diag::record(crate::diag::Ev::Raster {
             render_us: paint_start.elapsed().as_micros() as u64,
         });

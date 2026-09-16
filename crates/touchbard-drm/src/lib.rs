@@ -68,7 +68,10 @@ use std::rc::Rc;
 
 use drm::buffer::{Buffer as _, DrmFourcc};
 use drm::control::Device as ControlDevice;
-use drm::Device as DrmDeviceTrait;
+use drm::{
+    ClientCapability, Device as DrmDeviceTrait, DriverCapability, VblankWaitFlags,
+    VblankWaitTarget,
+};
 use touchbard_renderer::{Backend, FrameSource, Viewport};
 
 pub mod convert;
@@ -359,6 +362,58 @@ impl Backend for DrmBackend {
         let orientation = scanout.orientation;
         let framebuffer = scanout.framebuffer;
         let clip = [drm::control::ClipRect::new(0, 0, width, height)];
+        let vblank_diag = std::env::var("TOUCHBARD_DRM_VBLANK_DIAG").as_deref() == Ok("1");
+        let mut vblank_enabled = vblank_diag;
+        let mut vblank_frame = 0_u64;
+        let mut last_vblank_ns = None;
+        let vblank_clock = std::time::Instant::now();
+
+        if vblank_diag {
+            let driver = scanout.device.get_driver()?;
+            let mode = scanout.config.mode();
+            let (hstart, hend, htotal) = mode.hsync();
+            let (vstart, vend, vtotal) = mode.vsync();
+            let mode_hz = (mode.clock() as f64 * 1000.0) / (htotal as f64 * vtotal as f64);
+            eprintln!(
+                "DRM_VBLANK_INFO driver={} version={:?} connector={} crtc={} mode={}x{} vrefresh={} clock_khz={} hsync=({}, {}, {}) vsync=({}, {}, {}) mode_hz={:.6}",
+                driver.name().to_string_lossy(),
+                driver.version,
+                u32::from(scanout.config.connector()),
+                u32::from(scanout.config.crtc()),
+                mode.size().0,
+                mode.size().1,
+                mode.vrefresh(),
+                mode.clock(),
+                hstart,
+                hend,
+                htotal,
+                vstart,
+                vend,
+                vtotal,
+                mode_hz,
+            );
+            for capability in [
+                DriverCapability::DumbBuffer,
+                DriverCapability::VBlankHighCRTC,
+                DriverCapability::MonotonicTimestamp,
+                DriverCapability::ASyncPageFlip,
+                DriverCapability::AtomicASyncPageFlip,
+                DriverCapability::PageFlipTarget,
+                DriverCapability::CRTCInVBlankEvent,
+            ] {
+                let value = scanout.device.get_driver_capability(capability)?;
+                eprintln!("DRM_CAP {:?}={value}", capability);
+            }
+            eprintln!(
+                "DRM_ATOMIC_CLIENT_CAP {:?}",
+                scanout
+                    .device
+                    .set_client_capability(ClientCapability::Atomic, true)
+            );
+            eprintln!(
+                "DRM_VBLANK_DIAG vblank_wait=enabled high_crtc=0 page_flip=not-tested (would alter presentation)"
+            );
+        }
 
         // The single wake source for this loop: the runtime arms it (Dioxus
         // scheduler + shell redraw bridge) and it fires whenever a new frame
@@ -409,6 +464,7 @@ impl Backend for DrmBackend {
             // One scheduling decision per wake: present only when the source
             // actually has a frame for us.
             if let Some(frame) = source.borrow_mut().frame(Some(waker)) {
+                let render_done_us = vblank_clock.elapsed().as_micros();
                 let present_start = std::time::Instant::now();
                 if let Err(e) =
                     convert::convert_frame(&frame, &mut mapping, width, height, pitch, orientation)
@@ -417,6 +473,44 @@ impl Backend for DrmBackend {
                 } else if let Err(e) = scanout.device.dirty_framebuffer(framebuffer, &clip) {
                     eprintln!("WARN: dirty_framebuffer failed (frame not refreshed): {e}");
                 }
+                let dirty_submit_us = vblank_clock.elapsed().as_micros();
+                let frame_number = vblank_frame;
+                if vblank_diag {
+                    eprintln!(
+                        "DRM_SUBMIT frame={} render_done_us={} dirty_submit_us={} dirty_duration_us={}",
+                        frame_number,
+                        render_done_us,
+                        dirty_submit_us,
+                        present_start.elapsed().as_micros(),
+                    );
+                }
+                if vblank_enabled {
+                    match scanout.device.wait_vblank(
+                        VblankWaitTarget::Relative(1),
+                        VblankWaitFlags::empty(),
+                        0,
+                        frame_number as usize,
+                    ) {
+                        Ok(reply) => {
+                            let timestamp_ns = reply.time().map(|time| time.as_nanos());
+                            let delta_ns = timestamp_ns.zip(last_vblank_ns).map(|(now, last)| now - last);
+                            eprintln!(
+                                "DRM_VBLANK frame={} sequence={} timestamp_ns={:?} interval_ns={:?}",
+                                frame_number,
+                                reply.frame(),
+                                timestamp_ns,
+                                delta_ns,
+                            );
+                            last_vblank_ns = timestamp_ns;
+                            vblank_frame += 1;
+                        }
+                        Err(error) => {
+                            eprintln!("DRM_VBLANK unavailable error={error}");
+                            vblank_enabled = false;
+                        }
+                    }
+                }
+                vblank_frame += 1;
                 touchbard_renderer::diag::record(touchbard_renderer::diag::Ev::Present {
                     present_us: present_start.elapsed().as_micros() as u64,
                 });

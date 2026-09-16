@@ -4,7 +4,7 @@ use std::sync::{Arc, Mutex};
 use std::task::{Context as TaskContext, Waker};
 
 use blitz_dom::Document as _;
-use blitz_paint::paint_scene;
+use blitz_paint::paint_scene_at;
 use blitz_traits::events::UiEvent;
 use blitz_traits::shell::{ColorScheme, ShellProvider, Viewport as BlitzViewport};
 use dioxus_core::VirtualDom;
@@ -274,7 +274,14 @@ impl TouchbardSystem {
         let frame = self.renderer.render(
             |scene| {
                 let paint_start = std::time::Instant::now();
-                paint_scene(scene, &self.document, scale, width, height);
+                paint_scene_at(
+                    scene,
+                    &self.document,
+                    scale,
+                    width,
+                    height,
+                    Some(now),
+                );
                 touchbard_renderer::diag::record(touchbard_renderer::diag::Ev::SceneDone {
                     paint_us: paint_start.elapsed().as_micros() as u64,
                 });

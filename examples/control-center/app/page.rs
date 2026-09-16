@@ -48,7 +48,7 @@ const HOME_STYLE: &str = r#"
     .ball {
         width: 22px; height: 22px; margin-left: 16px;
         background: #7aa2f7; border-radius: 50%;
-        animation: circleSlide 20s linear infinite;
+        animation: circleSlide 60s linear infinite;
     }
 "#;
 

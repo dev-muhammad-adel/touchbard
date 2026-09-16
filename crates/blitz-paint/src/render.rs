@@ -46,6 +46,8 @@ pub struct BlitzDomPainter<'dom> {
     pub(crate) width: u32,
     pub(crate) height: u32,
     pub(crate) devtools: DevtoolSettings,
+    pub(crate) animation_time: Option<f64>,
+    pub(crate) trace_ball: bool,
 }
 
 impl BlitzDomPainter<'_> {
@@ -334,6 +336,46 @@ impl BlitzDomPainter<'_> {
                 origin_translation * kurbo_transform * origin_translation.inverse();
 
             transform *= kurbo_transform;
+        }
+
+        // The ball is the only 22px square div in the control-center scene.
+        // This diagnostic records both the CSS translation and the final
+        // floating-point paint translation; it is disabled unless explicitly
+        // requested for subpixel/judder investigation.
+        if self.trace_ball
+            && node.local_name() == "div"
+            && (layout.size.width - 22.0).abs() < 0.01
+            && (layout.size.height - 22.0).abs() < 0.01
+        {
+            if let Some(animation_time) = self.animation_time {
+                let cycle = animation_time.rem_euclid(20.0);
+                let progress = cycle / 20.0;
+                let expected_x = if progress <= 0.5 {
+                    progress * 2.0 * 1954.0
+                } else {
+                    (1.0 - progress) * 2.0 * 1954.0
+                };
+                let paint = transform.as_coeffs();
+                let wall_us = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_micros())
+                    .unwrap_or_default();
+                eprintln!(
+                    "BALL_TRACE wall_us={} animation_ms={:.3} progress={:.6} expected_x={:.6} computed_x={:.6} paint_x={:.6} transform=[{:.6},{:.6},{:.6},{:.6},{:.6},{:.6}]",
+                    wall_us,
+                    animation_time * 1000.0,
+                    progress,
+                    expected_x,
+                    t.m41 as f64,
+                    paint[4],
+                    paint[0],
+                    paint[1],
+                    paint[2],
+                    paint[3],
+                    paint[4],
+                    paint[5],
+                );
+            }
         }
 
         let element = node.element_data().unwrap();
