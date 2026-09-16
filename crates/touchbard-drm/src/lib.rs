@@ -1,58 +1,6 @@
 //! DRM/KMS backend for the Touchbard framework.
 //!
-//! The backend is structured in three layers:
-//!
-//! ```text
-//! DrmBackend
-//!     |
-//!     +--> hardware discovery   ([`discovery::HardwareDiscovery`]: does the
-//!     |                          hardware identified by VID/PID exist?)
-//!     +--> DRM card discovery   ([`discovery::DrmCardDiscovery`]: has the
-//!     |                          kernel exposed a DRM card for it?)
-//!     |
-//!     +--> DevicePreparer       (opt-in hardware workaround, only when needed)
-//!     |
-//!     +--> DrmDevice            (opened/owned in [`device`]; usable with the
-//!     |                          safe `drm` crate by implementing its
-//!     |                          [`drm::Device`] trait)
-//!     +--> KMS resources         ([`resources`]: connectors, their modes,
-//!     |                          encoders, and CRTCs of the card)
-//!     +--> display config        ([`modeset::select_display_config`]: the
-//!     |                          connected connector + encoder + CRTC + mode)
-//!     +--> Scanout               (this module: device + dumb buffer +
-//!     |                          framebuffer + orientation, modeset, CPU
-//!     |                          presentation loop)
-//! ```
-//!
-//! The two discovery operations are separate. [`discovery::discover_or_prepare`]
-//! first finds the target *hardware* by its [`HardwareId`]; only if the
-//! hardware exists does it look for the hardware's DRM *card*. A missing DRM
-//! card never automatically triggers a workaround: one runs only when the
-//! hardware was found, its DRM card is missing, and that [`HardwareId`] has a
-//! known workaround ([`preparer::workaround_for`]). Unknown hardware that
-//! cannot be found, or unknown hardware whose DRM card is missing, yields an
-//! unavailable error - the flow never guesses a workaround.
-//!
-//! The backend has no GBM/EGL allocator, no page flips, and no double
-//! buffering. It presents CPU-rendered frames through a single dumb buffer and
-//! a full-screen [`drm::control::Device::dirty_framebuffer`] refresh each
-//! cycle, which is exactly what the t2bdrm/appletbdrm Touch Bar driver expects.
-//!
-//! # Lifecycle
-//!
-//! [`DrmBackend::initialize`] runs the full discovery flow, opens the device,
-//! queries resources, selects a display configuration, allocates the dumb
-//! buffer (validating its CPU mapping), creates the framebuffer, acquires DRM
-//! master, performs the initial modeset, and returns the **physical** viewport
-//! (landscape, e.g. `2008×60`) for the UI system. [`DrmBackend::run`] then
-//! drives an event loop: block on a single wake source (see [`wakefd`]) →
-//! poll the frame source → convert ([`ScanoutOrientation`]) → DirtyFB, with a
-//! bounded wait (~60 Hz) only while the document is animating. Idle UI renders
-//! nothing and takes no CPU.
-//!
-//! The mapping is remapped per `run` call and unmapped on drop; teardown
-//! releases the CRTC, then destroys the framebuffer and dumb buffer - all RAII
-//! through [`Scanout`]'s `Drop`.
+//! The backend presents CPU-rendered frames through a single dumb buffer.
 //!
 //! # Orientation
 //!
@@ -65,20 +13,19 @@
 use std::cell::RefCell;
 use std::error::Error;
 use std::rc::Rc;
+use std::thread;
 
 use drm::buffer::{Buffer as _, DrmFourcc};
 use drm::control::Device as ControlDevice;
-use drm::{
-    ClientCapability, Device as DrmDeviceTrait, DriverCapability, VblankWaitFlags,
-    VblankWaitTarget,
-};
-use touchbard_renderer::{Backend, FrameSource, Viewport};
+use drm::Device as DrmDeviceTrait;
+use touchbard_renderer::{Backend, Frame, FrameSource, Viewport};
 
 pub mod convert;
 pub mod device;
 pub mod discovery;
 pub mod dumbbuffer;
 pub mod framebuffer;
+mod lifecycle;
 pub mod modeset;
 pub mod pattern;
 pub mod preparer;
@@ -104,9 +51,6 @@ use crate::dumbbuffer::BPP;
 use crate::framebuffer::DEPTH;
 
 /// UI scale factor: physical pixels per logical pixel.
-///
-/// The `control-center` pages are authored at 2008×60 logical pixels (1:1 with
-/// the Touch Bar's native resolution), so scanout maps 1:1.
 const SCALE_FACTOR: f64 = 1.0;
 
 /// Configuration for the DRM backend.
@@ -142,18 +86,7 @@ impl DrmConfig {
     }
 }
 
-/// An active DRM scanout: the opened device plus the buffer/framebuffer bound
-/// to it, ready to present frames.
-///
-/// Owned by [`DrmBackend`] after [`DrmBackend::initialize`] succeeds and
-/// released by its `Drop` on teardown - the kernel-side resources (framebuffer,
-/// dumb buffer) are destroyed exactly once, in order, before the device closes.
-///
-/// The device is stored by value (`DrmDevice`), so the dumb buffer and
-/// framebuffer are stored as their raw kernel handles rather than the
-/// borrow-lifetime wrappers in [`crate::framebuffer`]/[`crate::dumbbuffer`]:
-/// the buffer geometry is what matters during `run`, and teardown only needs
-/// the device plus handles. This avoids a self-referential struct.
+/// An active DRM scanout and its kernel resources.
 pub struct Scanout {
     device: DrmDevice,
     buffer: drm::control::dumbbuffer::DumbBuffer,
@@ -166,33 +99,26 @@ pub struct Scanout {
 }
 
 impl Scanout {
-    /// The DRM framebuffer handle being scanned out.
     pub fn framebuffer(&self) -> drm::control::framebuffer::Handle {
         self.framebuffer
     }
 
-    /// The dumb-buffer width in pixels (the DRM framebuffer's width).
     pub fn width(&self) -> u16 {
         self.width
     }
 
-    /// The dumb-buffer height in pixels (the DRM framebuffer's height).
     pub fn height(&self) -> u16 {
         self.height
     }
 
-    /// The dumb buffer's row pitch in bytes.
     pub fn pitch(&self) -> u32 {
         self.pitch
     }
 
-    /// The orientation frames are stored with.
     pub fn orientation(&self) -> ScanoutOrientation {
         self.orientation
     }
 
-    /// The physical (panel) size the UI must be built at: the orientation's
-    /// viewport size of the DRM framebuffer.
     pub fn viewport_size(&self) -> (u16, u16) {
         self.orientation.viewport_size(self.width, self.height)
     }
@@ -200,24 +126,19 @@ impl Scanout {
 
 impl Drop for Scanout {
     fn drop(&mut self) {
-        // Unbind the CRTC first, so the kernel is no longer scanning the
-        // framebuffer by the time it is destroyed.
+        // The CRTC must be disabled before its framebuffer is destroyed.
         if let Err(e) = modeset::disable_crtc(&self.device, &self.config) {
             eprintln!("teardown: disabling CRTC failed (ignored): {e}");
         }
-        // Destroy the framebuffer.
         if let Err(e) = self.device.destroy_framebuffer(self.framebuffer) {
             eprintln!(
                 "teardown: destroying framebuffer {} failed (ignored): {e}",
                 u32::from(self.framebuffer)
             );
         }
-        // Destroy the dumb buffer. The mapping unmapped when `run` returned,
-        // so no buffer is left pinned.
         if let Err(e) = self.device.destroy_dumb_buffer(self.buffer) {
             eprintln!("teardown: destroying dumb buffer failed (ignored): {e}");
         }
-        // The device's fd closes as this field drops, releasing DRM master.
     }
 }
 
@@ -228,7 +149,6 @@ pub struct DrmBackend {
 }
 
 impl DrmBackend {
-    /// Build the DRM backend from its configuration.
     pub fn new(config: DrmConfig) -> Self {
         Self {
             config,
@@ -236,7 +156,6 @@ impl DrmBackend {
         }
     }
 
-    /// Build the backend from `DrmConfig::from_env()`.
     pub fn from_env() -> Self {
         Self::new(DrmConfig::from_env())
     }
@@ -318,7 +237,6 @@ impl DrmBackend {
             .acquire_master_lock()
             .map_err(|e| io_err("acquire_master_lock (needs root or the drm group)", e))?;
         initial_modeset(&device, framebuffer, &display_config)?;
-
         Ok(Scanout {
             device,
             buffer,
@@ -348,188 +266,102 @@ impl Backend for DrmBackend {
         &mut self,
         source: Rc<RefCell<dyn FrameSource>>,
     ) -> Result<(), Box<dyn Error + Send + Sync>> {
-        let scanout = self
-            .scanout
-            .as_mut()
-            .ok_or_else(|| "the DRM backend is not initialized".to_string())?;
-
-        // The mapping borrows only `scanout.buffer`, so the device (used below
-        // for DirtyFB) stays independently accessible - no self-borrow.
-        let mut mapping = scanout.device.map_dumb_buffer(&mut scanout.buffer)?;
-        let width = scanout.width;
-        let height = scanout.height;
-        let pitch = scanout.pitch;
-        let orientation = scanout.orientation;
-        let framebuffer = scanout.framebuffer;
-        let clip = [drm::control::ClipRect::new(0, 0, width, height)];
-        let vblank_diag = std::env::var("TOUCHBARD_DRM_VBLANK_DIAG").as_deref() == Ok("1");
-        let mut vblank_enabled = vblank_diag;
-        let mut vblank_frame = 0_u64;
-        let mut last_vblank_ns = None;
-        let vblank_clock = std::time::Instant::now();
-
-        if vblank_diag {
-            let driver = scanout.device.get_driver()?;
-            let mode = scanout.config.mode();
-            let (hstart, hend, htotal) = mode.hsync();
-            let (vstart, vend, vtotal) = mode.vsync();
-            let mode_hz = (mode.clock() as f64 * 1000.0) / (htotal as f64 * vtotal as f64);
-            eprintln!(
-                "DRM_VBLANK_INFO driver={} version={:?} connector={} crtc={} mode={}x{} vrefresh={} clock_khz={} hsync=({}, {}, {}) vsync=({}, {}, {}) mode_hz={:.6}",
-                driver.name().to_string_lossy(),
-                driver.version,
-                u32::from(scanout.config.connector()),
-                u32::from(scanout.config.crtc()),
-                mode.size().0,
-                mode.size().1,
-                mode.vrefresh(),
-                mode.clock(),
-                hstart,
-                hend,
-                htotal,
-                vstart,
-                vend,
-                vtotal,
-                mode_hz,
-            );
-            for capability in [
-                DriverCapability::DumbBuffer,
-                DriverCapability::VBlankHighCRTC,
-                DriverCapability::MonotonicTimestamp,
-                DriverCapability::ASyncPageFlip,
-                DriverCapability::AtomicASyncPageFlip,
-                DriverCapability::PageFlipTarget,
-                DriverCapability::CRTCInVBlankEvent,
-            ] {
-                let value = scanout.device.get_driver_capability(capability)?;
-                eprintln!("DRM_CAP {:?}={value}", capability);
-            }
-            eprintln!(
-                "DRM_ATOMIC_CLIENT_CAP {:?}",
-                scanout
-                    .device
-                    .set_client_capability(ClientCapability::Atomic, true)
-            );
-            eprintln!(
-                "DRM_VBLANK_DIAG vblank_wait=enabled high_crtc=0 page_flip=not-tested (would alter presentation)"
-            );
-        }
-
-        // The single wake source for this loop: the runtime arms it (Dioxus
-        // scheduler + shell redraw bridge) and it fires whenever a new frame
-        // is wanted. Input devices, when added later, join the same poll set.
-        // `waker()` leaks one tiny boxed waker per run, so it is created once.
+        let mut scanout = Some(
+            self.scanout
+                .take()
+                .ok_or_else(|| "the DRM backend is not initialized".to_string())?,
+        );
         let wake = WakeFd::new()?;
         let waker = wake.waker();
-
-        // Deadine-based pacing experiment (A/B, temporary): with
-        // `TOUCHBARD_DRM_PACING_TEST=1` the loop anchors each frame to an
-        // absolute 60 Hz deadline and waits only for the remaining time, so a
-        // frame that takes a few ms to render + transfer still lands on the
-        // grid instead of being shifted by the full extra tick. Missed
-        // deadlines advance the grid (no backlog); this is not the default.
-        let deadline_pacing =
-            std::env::var("TOUCHBARD_DRM_PACING_TEST").as_deref() == Ok("1");
-        let mut next_deadline = std::time::Instant::now();
-        if deadline_pacing {
-            eprintln!("DRM pacing: deadline-based (TOUCHBARD_DRM_PACING_TEST=1)");
-        }
+        let mut lifecycle = match lifecycle::SleepWatcher::start(&wake) {
+            Ok(watcher) => Some(watcher),
+            Err(error) => {
+                eprintln!("DRM lifecycle watcher unavailable: {error}");
+                None
+            }
+        };
+        let mut suspended = false;
+        let mut repaint_after_resume = false;
+        let mut last_frame: Option<Frame> = None;
 
         loop {
-            // Wait for the next reason to render: indefinitely while the
-            // document is idle, at most one animation tick while animating
-            // (or, under the experiment, until the next absolute deadline).
             let animating = source.borrow().needs_redraw();
-            let wait_start = std::time::Instant::now();
-            if deadline_pacing && animating {
-                // Absolute frame deadline: wait only until `next_deadline`, so
-                // the produce + DirtyFB transfer below stays inside the frame
-                // budget instead of stacking a full 16ms tick on top of it.
-                let now = std::time::Instant::now();
-                if now < next_deadline {
-                    wake.wait(Some(next_deadline - now))?;
-                }
+            let budget = if animating {
+                Some(wakefd::ANIM_TICK)
             } else {
-                let budget = if animating {
-                    Some(wakefd::ANIM_TICK)
-                } else {
-                    None
-                };
-                wake.wait(budget)?;
-            }
-            touchbard_renderer::diag::record(touchbard_renderer::diag::Ev::Wait {
-                wait_us: wait_start.elapsed().as_micros() as u64,
-            });
+                None
+            };
+            wake.wait(budget)?;
 
-            // One scheduling decision per wake: present only when the source
-            // actually has a frame for us.
-            if let Some(frame) = source.borrow_mut().frame(Some(waker)) {
-                let render_done_us = vblank_clock.elapsed().as_micros();
-                let present_start = std::time::Instant::now();
-                if let Err(e) =
+            while let Some(event) = lifecycle.as_ref().and_then(|watcher| watcher.try_recv()) {
+                match event {
+                    lifecycle::SleepEvent::PrepareForSleep(true) if !suspended => {
+                        eprintln!("DRM suspend: releasing Touch Bar display resources");
+                        drop(scanout.take());
+                        if let Some(watcher) = lifecycle.as_mut() {
+                            watcher.release_inhibitor();
+                        }
+                        suspended = true;
+                    }
+                    lifecycle::SleepEvent::PrepareForSleep(false) if suspended => {
+                        eprintln!("DRM resume: rediscovering Touch Bar display");
+                        if let Some(watcher) = lifecycle.as_mut() {
+                            watcher.acquire_inhibitor()?;
+                        }
+                        loop {
+                            match Self::create_scanout(self.config) {
+                                Ok(new_scanout) => {
+                                    scanout = Some(new_scanout);
+                                    suspended = false;
+                                    repaint_after_resume = true;
+                                    break;
+                                }
+                                Err(error) => {
+                                    eprintln!("DRM resume: display not ready, retrying: {error}");
+                                    thread::sleep(std::time::Duration::from_millis(250));
+                                }
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+
+            if suspended {
+                continue;
+            }
+
+            let frame = if repaint_after_resume {
+                repaint_after_resume = false;
+                last_frame.clone()
+            } else {
+                source.borrow_mut().frame(Some(waker))
+            };
+            if let Some(frame) = frame {
+                last_frame = Some(frame.clone());
+                let scanout = scanout
+                    .as_mut()
+                    .ok_or_else(|| "DRM scanout unavailable outside suspend".to_string())?;
+                let width = scanout.width;
+                let height = scanout.height;
+                let pitch = scanout.pitch;
+                let orientation = scanout.orientation;
+                let framebuffer = scanout.framebuffer;
+                let clip = [drm::control::ClipRect::new(0, 0, width, height)];
+                let conversion = {
+                    let mut mapping = scanout.device.map_dumb_buffer(&mut scanout.buffer)?;
                     convert::convert_frame(&frame, &mut mapping, width, height, pitch, orientation)
-                {
+                };
+                if let Err(e) = conversion {
                     eprintln!("WARN: dropping frame (conversion failed): {e}");
                 } else if let Err(e) = scanout.device.dirty_framebuffer(framebuffer, &clip) {
                     eprintln!("WARN: dirty_framebuffer failed (frame not refreshed): {e}");
-                }
-                let dirty_submit_us = vblank_clock.elapsed().as_micros();
-                let frame_number = vblank_frame;
-                if vblank_diag {
-                    eprintln!(
-                        "DRM_SUBMIT frame={} render_done_us={} dirty_submit_us={} dirty_duration_us={}",
-                        frame_number,
-                        render_done_us,
-                        dirty_submit_us,
-                        present_start.elapsed().as_micros(),
-                    );
-                }
-                if vblank_enabled {
-                    match scanout.device.wait_vblank(
-                        VblankWaitTarget::Relative(1),
-                        VblankWaitFlags::empty(),
-                        0,
-                        frame_number as usize,
-                    ) {
-                        Ok(reply) => {
-                            let timestamp_ns = reply.time().map(|time| time.as_nanos());
-                            let delta_ns = timestamp_ns.zip(last_vblank_ns).map(|(now, last)| now - last);
-                            eprintln!(
-                                "DRM_VBLANK frame={} sequence={} timestamp_ns={:?} interval_ns={:?}",
-                                frame_number,
-                                reply.frame(),
-                                timestamp_ns,
-                                delta_ns,
-                            );
-                            last_vblank_ns = timestamp_ns;
-                            vblank_frame += 1;
-                        }
-                        Err(error) => {
-                            eprintln!("DRM_VBLANK unavailable error={error}");
-                            vblank_enabled = false;
-                        }
-                    }
-                }
-                vblank_frame += 1;
-                touchbard_renderer::diag::record(touchbard_renderer::diag::Ev::Present {
-                    present_us: present_start.elapsed().as_micros() as u64,
-                });
-            }
-
-            if deadline_pacing {
-                // Advance the deadline in whole frame periods; never park it
-                // behind `now` (a missed deadline costs one frame, not a
-                // growing backlog).
-                while next_deadline <= std::time::Instant::now() {
-                    next_deadline += wakefd::FRAME_PERIOD;
                 }
             }
         }
     }
 }
 
-/// Wrap an ioctl [`std::io::Error`] with the action that failed, for clean
-/// error chaining toward `Box<dyn Error + Send + Sync>`.
 fn io_err(action: &str, e: std::io::Error) -> Box<dyn Error + Send + Sync> {
     format!("{action} failed: {e}").into()
 }
@@ -571,8 +403,6 @@ mod tests {
 
     #[test]
     fn scanout_viewport_size_applies_the_orientation() {
-        // The Touch Bar exposes a 60×2008 framebuffer; the UI must use the
-        // physical 2008×60 landscape.
         assert_eq!(
             ScanoutOrientation::Transpose.viewport_size(60, 2008),
             (2008, 60)

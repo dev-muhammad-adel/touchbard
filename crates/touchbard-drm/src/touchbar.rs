@@ -1,30 +1,17 @@
 //! Touch Bar-specific hardware preparation.
 //!
-//! The Touch Bar display is an Apple USB device (vendor `0x05ac`, product
-//! `0x8302`) with two USB configurations: configuration 1 is the firmware
-//! function-row strip, and configuration 2 exposes the display interface the
-//! DRM driver binds. Most DRM hardware needs nothing like this; this module is
-//! the opt-in workaround for the one known exception, selected by the generic
-//! [`crate::workaround_for`] lookup.
-//!
-//! This module owns all Touch Bar knowledge (the VID/PID, the configuration
-//! switch) and no DRM knowledge: it never opens a DRM device, picks a card, or
-//! touches framebuffer/modeset/rendering.
-
 use std::error::Error;
 use std::fs;
 use std::fs::OpenOptions;
+use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::thread;
 use std::time::{Duration, Instant};
 
 use crate::preparer::{DevicePreparer, HardwareId};
 
-/// Apple's USB vendor id.
 pub const TOUCHBAR_USB_VENDOR_ID: u16 = 0x05ac;
-/// The Touch Bar Display product id.
 pub const TOUCHBAR_USB_PRODUCT_ID: u16 = 0x8302;
-/// The hardware identity of the Touch Bar Display.
 pub const TOUCHBAR_ID: HardwareId = HardwareId {
     vendor_id: TOUCHBAR_USB_VENDOR_ID,
     product_id: TOUCHBAR_USB_PRODUCT_ID,
@@ -33,26 +20,30 @@ pub const TOUCHBAR_ID: HardwareId = HardwareId {
 /// is the firmware function-row strip; only configuration 2 makes the display
 /// interface appear so the kernel can bind a driver to it.
 pub const TOUCHBAR_DISPLAY_USB_CONFIG: u8 = 2;
+const USBDEVFS_RESET: libc::c_ulong = 0x5514;
 
-/// Default total time to keep waiting for the Touch Bar to be prepared.
 const USB_WAIT: Duration = Duration::from_secs(30);
-/// Poll interval while waiting for the USB device / its permissions to settle.
 const USB_POLL: Duration = Duration::from_millis(250);
 
 /// The USB sysfs operations the Touch Bar preparation needs, behind a small
 /// seam so the preparation logic is testable without the physical device.
 pub trait UsbAccess {
-    /// Find the sysfs directory of the USB device with `id`, if present.
     fn find(&self, id: HardwareId) -> Option<PathBuf>;
-    /// The device's current configuration number, `None` when absent or
-    /// unconfigured.
-    fn config_value(&self, dir: &Path) -> Option<u8>;
+    /// The device's current configuration number. An empty sysfs value means
+    /// the device is unconfigured; an I/O or parse failure is an error.
+    fn config_value(&self, dir: &Path) -> Result<UsbConfiguration, Box<dyn Error + Send + Sync>>;
     /// Whether the configuration node is writable yet. udev applies the
     /// group/ownership a beat after enumeration, so this can briefly be false
     /// right after a device appears.
     fn config_writable(&self, dir: &Path) -> bool;
-    /// Set the active USB configuration to `value`.
     fn set_config(&self, dir: &Path, value: u8) -> Result<(), Box<dyn Error + Send + Sync>>;
+    fn reset(&self, dir: &Path) -> Result<(), Box<dyn Error + Send + Sync>>;
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UsbConfiguration {
+    Unconfigured,
+    Configured(u8),
 }
 
 /// The sysfs-backed [`UsbAccess`], scanning `/sys/bus/usb/devices` for
@@ -69,15 +60,12 @@ impl Default for SysfsUsbAccess {
 }
 
 impl SysfsUsbAccess {
-    /// An accessor scanning `sysfs_root` instead of the real sysfs (used by
-    /// tests against a scratch tree; production uses [`Default`]).
     pub fn new(sysfs_root: impl Into<PathBuf>) -> Self {
         Self {
             sysfs_root: sysfs_root.into(),
         }
     }
 
-    /// The sysfs device-tree root this accessor scans.
     pub fn sysfs_root(&self) -> &Path {
         &self.sysfs_root
     }
@@ -108,9 +96,14 @@ impl UsbAccess for SysfsUsbAccess {
         None
     }
 
-    fn config_value(&self, dir: &Path) -> Option<u8> {
-        let raw = fs::read_to_string(dir.join("bConfigurationValue")).ok()?;
-        raw.trim().parse().ok()
+    fn config_value(&self, dir: &Path) -> Result<UsbConfiguration, Box<dyn Error + Send + Sync>> {
+        let raw = fs::read_to_string(dir.join("bConfigurationValue"))?;
+        let value = raw.trim();
+        if value.is_empty() || value == "0" {
+            Ok(UsbConfiguration::Unconfigured)
+        } else {
+            Ok(UsbConfiguration::Configured(value.parse()?))
+        }
     }
 
     fn config_writable(&self, dir: &Path) -> bool {
@@ -124,6 +117,22 @@ impl UsbAccess for SysfsUsbAccess {
         fs::write(dir.join("bConfigurationValue"), value.to_string())?;
         Ok(())
     }
+
+    fn reset(&self, dir: &Path) -> Result<(), Box<dyn Error + Send + Sync>> {
+        let bus = fs::read_to_string(dir.join("busnum"))?
+            .trim()
+            .parse::<u8>()?;
+        let device = fs::read_to_string(dir.join("devnum"))?
+            .trim()
+            .parse::<u8>()?;
+        let path = format!("/dev/bus/usb/{bus:03}/{device:03}");
+        let file = OpenOptions::new().read(true).write(true).open(path)?;
+        let result = unsafe { libc::ioctl(file.as_raw_fd(), USBDEVFS_RESET) };
+        if result < 0 {
+            return Err(std::io::Error::last_os_error().into());
+        }
+        Ok(())
+    }
 }
 
 /// Reads a sysfs attribute encoded as a hexadecimal number (e.g. idVendor =
@@ -133,14 +142,7 @@ fn read_u16_hex(path: &Path) -> Option<u16> {
     u16::from_str_radix(raw.trim(), 16).ok()
 }
 
-/// Prepares Touch Bar hardware for DRM discovery: finds the 05ac:8302 USB
-/// device and ensures it is in its display USB configuration (2), so the
-/// display interface appears and a DRM driver can bind.
-///
-/// This is the known preparation workaround for the one hardware identity that
-/// needs it. It only ever does USB plumbing; waiting for the *DRM device* to
-/// become visible afterwards is the job of the discovery flow
-/// ([`crate::discover_or_prepare`]).
+/// Prepares the Touch Bar USB device for DRM discovery.
 pub struct TouchBarDevicePreparer {
     access: Box<dyn UsbAccess>,
     wait: Duration,
@@ -154,7 +156,6 @@ impl Default for TouchBarDevicePreparer {
 }
 
 impl TouchBarDevicePreparer {
-    /// A preparer driving the real sysfs USB device tree.
     pub fn new() -> Self {
         Self {
             access: Box::new(SysfsUsbAccess::default()),
@@ -163,8 +164,6 @@ impl TouchBarDevicePreparer {
         }
     }
 
-    /// A preparer driving a custom [`UsbAccess`] with bounded waits/polling
-    /// (used by tests; production goes through [`Self::new`]).
     pub fn with_access(access: Box<dyn UsbAccess>, wait: Duration, poll: Duration) -> Self {
         Self { access, wait, poll }
     }
@@ -174,47 +173,125 @@ impl DevicePreparer for TouchBarDevicePreparer {
     fn prepare(&mut self) -> Result<(), Box<dyn Error + Send + Sync>> {
         let deadline = Instant::now() + self.wait;
 
-        // The device may enumerate late (e.g. the USB bus re-enumerates from
-        // scratch); wait for it to appear before touching its configuration.
         let mut dir = self.find_usb_device(deadline)?;
 
-        // Ensure the display configuration is active.
-        while self.access.config_value(&dir) != Some(TOUCHBAR_DISPLAY_USB_CONFIG) {
+        let mut last_write_error = None;
+        let mut awaiting_reenumeration = false;
+        let mut reset_completed = false;
+        loop {
             if Instant::now() >= deadline {
+                let detail = last_write_error
+                    .map(|e: Box<dyn Error + Send + Sync>| format!("; last write failed: {e}"))
+                    .unwrap_or_default();
                 return Err(touch_bar_error(&format!(
-                    "did not reach configuration {}",
-                    TOUCHBAR_DISPLAY_USB_CONFIG
+                    "did not reach configuration {}{}",
+                    TOUCHBAR_DISPLAY_USB_CONFIG, detail
                 )));
             }
-            // udev applies the config node's permissions a beat after
-            // enumeration; wait for write access before attempting the switch.
+            match self.access.config_value(&dir)? {
+                UsbConfiguration::Configured(TOUCHBAR_DISPLAY_USB_CONFIG) => return Ok(()),
+                UsbConfiguration::Configured(value) => {
+                    reset_completed = false;
+                    if awaiting_reenumeration {
+                        thread::sleep(self.poll);
+                        continue;
+                    }
+                    eprintln!("Touch Bar USB is in configuration {value}; switching to 2");
+                }
+                UsbConfiguration::Unconfigured => {
+                    if !reset_completed {
+                        eprintln!("Touch Bar USB is unconfigured; resetting before re-enumeration");
+                        self.access.reset(&dir)?;
+                        dir = self.find_usb_device(deadline)?;
+                        reset_completed = true;
+                        awaiting_reenumeration = false;
+                        continue;
+                    }
+                }
+            }
+            // udev may make the sysfs control writable after enumeration.
             if !self.access.config_writable(&dir) {
                 thread::sleep(self.poll);
                 continue;
             }
-            // Switch through an unconfigured state (a direct 1 -> 2 write does
-            // not take effect on the T2 firmware).
-            let switched = self.access.set_config(&dir, 0).is_ok()
-                && self
-                    .access
-                    .set_config(&dir, TOUCHBAR_DISPLAY_USB_CONFIG)
-                    .is_ok();
-            if !switched {
-                // A failed configuration write makes the kernel reset the
-                // device and the devpath can change; re-resolve it.
+            if let Err(error) = self.access.set_config(&dir, TOUCHBAR_DISPLAY_USB_CONFIG) {
+                last_write_error = Some(error);
+                reset_completed = false;
                 dir = self.find_usb_device(deadline)?;
                 thread::sleep(self.poll);
-            } else if self.access.config_value(&dir) == Some(TOUCHBAR_DISPLAY_USB_CONFIG) {
-                return Ok(());
+                continue;
+            }
+            // A configuration switch can re-enumerate the USB device.
+            reset_completed = false;
+            awaiting_reenumeration = true;
+            dir = self.find_usb_device(deadline)?;
+        }
+    }
+
+    fn recover_no_card(&mut self) -> Result<(), Box<dyn Error + Send + Sync>> {
+        let deadline = Instant::now() + self.wait;
+        let mut dir = self.find_usb_device(deadline)?;
+
+        if self.access.config_value(&dir)?
+            != UsbConfiguration::Configured(TOUCHBAR_DISPLAY_USB_CONFIG)
+        {
+            return self.prepare();
+        }
+        if !self.access.config_writable(&dir) {
+            while !self.access.config_writable(&dir) {
+                if Instant::now() >= deadline {
+                    return Err(touch_bar_error(
+                        "configuration node did not become writable during no-card recovery",
+                    ));
+                }
+                thread::sleep(self.poll);
             }
         }
-        Ok(())
+
+        eprintln!("Touch Bar config 2 + no DRM card detected; performing no-card recovery/reprobe");
+        self.access.set_config(&dir, 0)?;
+        loop {
+            dir = self.find_usb_device(deadline)?;
+            match self.access.config_value(&dir)? {
+                UsbConfiguration::Unconfigured => {
+                    self.access.reset(&dir)?;
+                    dir = self.find_usb_device(deadline)?;
+                    if !self.access.config_writable(&dir) {
+                        while !self.access.config_writable(&dir) {
+                            if Instant::now() >= deadline {
+                                return Err(touch_bar_error(
+                                    "configuration node did not become writable after no-card reset",
+                                ));
+                            }
+                            thread::sleep(self.poll);
+                        }
+                    }
+                    self.access.set_config(&dir, TOUCHBAR_DISPLAY_USB_CONFIG)?;
+                    dir = self.find_usb_device(deadline)?;
+                    return match self.access.config_value(&dir)? {
+                        UsbConfiguration::Configured(TOUCHBAR_DISPLAY_USB_CONFIG) => Ok(()),
+                        _ => self.prepare(),
+                    };
+                }
+                UsbConfiguration::Configured(TOUCHBAR_DISPLAY_USB_CONFIG) => {
+                    if Instant::now() >= deadline {
+                        return Err(touch_bar_error(
+                            "config 2 did not leave the device during no-card recovery",
+                        ));
+                    }
+                    thread::sleep(self.poll);
+                }
+                UsbConfiguration::Configured(value) => {
+                    return Err(touch_bar_error(&format!(
+                        "unexpected configuration {value} during no-card recovery"
+                    )));
+                }
+            }
+        }
     }
 }
 
 impl TouchBarDevicePreparer {
-    /// Polls `find` until the Touch Bar USB device shows up or `deadline`
-    /// passes.
     fn find_usb_device(&self, deadline: Instant) -> Result<PathBuf, Box<dyn Error + Send + Sync>> {
         loop {
             if let Some(dir) = self.access.find(TOUCHBAR_ID) {
@@ -243,7 +320,6 @@ mod tests {
     use std::sync::Arc;
     use std::time::SystemTime;
 
-    /// Unique scratch dir for one test run; removed (best-effort) afterwards.
     struct Scratch(PathBuf);
     impl Scratch {
         fn new() -> Self {
@@ -269,8 +345,6 @@ mod tests {
         fs::write(dir.join(name), text).expect("write sysfs attr");
     }
 
-    /// The Touch Bar identity and display configuration are the *Touch Bar's*
-    /// responsibility and live here, not in generic DRM code.
     #[test]
     fn touch_bar_knowledge_is_05ac_8302_config_2() {
         assert_eq!(TOUCHBAR_USB_VENDOR_ID, 0x05ac);
@@ -289,7 +363,6 @@ mod tests {
         dev
     }
 
-    /// Sysfs discovery locates 05ac:8302 and ignores unrelated devices.
     #[test]
     fn sysfs_find_locates_the_touch_bar() {
         let scratch = Scratch::new();
@@ -316,8 +389,6 @@ mod tests {
             .is_none());
     }
 
-    /// A device in the firmware configuration (1) is switched to the display
-    /// configuration (2) end to end through the real sysfs accessor.
     #[test]
     fn sysfs_prepare_switches_config_1_to_2() {
         let scratch = Scratch::new();
@@ -331,10 +402,12 @@ mod tests {
         );
         preparer.prepare().expect("preparation succeeds");
 
-        assert_eq!(access.config_value(&dev), Some(TOUCHBAR_DISPLAY_USB_CONFIG));
+        assert_eq!(
+            access.config_value(&dev).unwrap(),
+            UsbConfiguration::Configured(TOUCHBAR_DISPLAY_USB_CONFIG)
+        );
     }
 
-    /// A device already in configuration 2 needs no work.
     #[test]
     fn sysfs_prepare_no_op_when_already_in_display_config() {
         let scratch = Scratch::new();
@@ -347,12 +420,12 @@ mod tests {
             Duration::from_millis(5),
         );
         preparer.prepare().expect("already prepared");
-        assert_eq!(access.config_value(&dev), Some(2));
+        assert_eq!(
+            access.config_value(&dev).unwrap(),
+            UsbConfiguration::Configured(2)
+        );
     }
 
-    /// A scripted [`UsbAccess`] whose behavior is driven by shared atomics, so
-    /// the preparation logic under test stays single-threaded but a helper
-    /// thread can "unstick" a wait (late enumeration / udev permission race).
     #[derive(Clone)]
     struct ScriptedUsb {
         present: Arc<AtomicBool>,
@@ -360,6 +433,9 @@ mod tests {
         writable: Arc<AtomicBool>,
         write_failures: Arc<AtomicUsize>,
         reject_display_config: Arc<AtomicBool>,
+        reset_count: Arc<AtomicUsize>,
+        empty_after_set: Arc<AtomicBool>,
+        read_error: Arc<AtomicBool>,
     }
 
     impl ScriptedUsb {
@@ -370,6 +446,9 @@ mod tests {
                 writable: Arc::new(AtomicBool::new(writable)),
                 write_failures: Arc::new(AtomicUsize::new(0)),
                 reject_display_config: Arc::new(AtomicBool::new(false)),
+                reset_count: Arc::new(AtomicUsize::new(0)),
+                empty_after_set: Arc::new(AtomicBool::new(false)),
+                read_error: Arc::new(AtomicBool::new(false)),
             }
         }
     }
@@ -381,8 +460,19 @@ mod tests {
                 .then(|| PathBuf::from("/sys/fake/1-1"))
         }
 
-        fn config_value(&self, _dir: &Path) -> Option<u8> {
-            Some(self.config.load(Ordering::SeqCst))
+        fn config_value(
+            &self,
+            _dir: &Path,
+        ) -> Result<UsbConfiguration, Box<dyn Error + Send + Sync>> {
+            if self.read_error.load(Ordering::SeqCst) {
+                return Err("injected configuration read failure".into());
+            }
+            let value = self.config.load(Ordering::SeqCst);
+            Ok(if value == 0 {
+                UsbConfiguration::Unconfigured
+            } else {
+                UsbConfiguration::Configured(value)
+            })
         }
 
         fn config_writable(&self, _dir: &Path) -> bool {
@@ -399,7 +489,20 @@ mod tests {
                 self.write_failures.fetch_sub(1, Ordering::SeqCst);
                 return Err("injected write failure".into());
             }
-            self.config.store(value, Ordering::SeqCst);
+            if value == TOUCHBAR_DISPLAY_USB_CONFIG
+                && self.empty_after_set.swap(false, Ordering::SeqCst)
+            {
+                self.config.store(0, Ordering::SeqCst);
+            } else {
+                self.config.store(value, Ordering::SeqCst);
+            }
+            Ok(())
+        }
+
+        fn reset(&self, _dir: &Path) -> Result<(), Box<dyn Error + Send + Sync>> {
+            self.reset_count.fetch_add(1, Ordering::SeqCst);
+            self.config
+                .store(TOUCHBAR_DISPLAY_USB_CONFIG, Ordering::SeqCst);
             Ok(())
         }
     }
@@ -412,8 +515,6 @@ mod tests {
         )
     }
 
-    /// The preparation waits for udev's permission race to clear before it
-    /// attempts the configuration switch.
     #[test]
     fn waits_for_config_writability_before_switching() {
         let configured = Arc::new(AtomicBool::new(false));
@@ -435,8 +536,6 @@ mod tests {
         switch_thread.join().unwrap();
     }
 
-    /// A failed configuration write is retried (through a re-resolve) until it
-    /// lands; the injected failure disturbs only the first `set_config` call.
     #[test]
     fn retries_after_a_failed_config_switch() {
         let usb = ScriptedUsb::new(1, true);
@@ -447,8 +546,52 @@ mod tests {
         assert_eq!(usb.config.load(Ordering::SeqCst), 2);
     }
 
-    /// If the device only shows up late, preparation waits for it instead of
-    /// failing immediately.
+    #[test]
+    fn unconfigured_device_is_reset_and_reaches_display_config() {
+        let usb = ScriptedUsb::new(0, true);
+        let mut preparer = fast_preparer(Box::new(usb.clone()));
+
+        preparer.prepare().expect("reset makes the device ready");
+        assert_eq!(usb.reset_count.load(Ordering::SeqCst), 1);
+        assert_eq!(usb.config.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn failed_post_switch_verification_resets_and_restarts() {
+        let usb = ScriptedUsb::new(1, true);
+        usb.empty_after_set.store(true, Ordering::SeqCst);
+        let mut preparer = fast_preparer(Box::new(usb.clone()));
+
+        preparer
+            .prepare()
+            .expect("reset recovers the failed switch");
+        assert_eq!(usb.reset_count.load(Ordering::SeqCst), 1);
+        assert_eq!(usb.config.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn no_card_recovery_resets_config_2_and_restores_it() {
+        let usb = ScriptedUsb::new(2, true);
+        let mut preparer = fast_preparer(Box::new(usb.clone()));
+
+        preparer
+            .recover_no_card()
+            .expect("no-card recovery succeeds");
+        assert_eq!(usb.reset_count.load(Ordering::SeqCst), 1);
+        assert_eq!(usb.config.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn configuration_read_errors_are_not_treated_as_unconfigured() {
+        let usb = ScriptedUsb::new(1, true);
+        usb.read_error.store(true, Ordering::SeqCst);
+        let mut preparer = fast_preparer(Box::new(usb.clone()));
+
+        let error = preparer.prepare().expect_err("read failure must propagate");
+        assert!(error.to_string().contains("configuration read failure"));
+        assert_eq!(usb.reset_count.load(Ordering::SeqCst), 0);
+    }
+
     #[test]
     fn waits_for_a_late_device() {
         let usb = ScriptedUsb::new(1, true);
@@ -466,7 +609,6 @@ mod tests {
         appeared.join().unwrap();
     }
 
-    /// A missing device fails within the bounded wait, not forever.
     #[test]
     fn missing_device_fails_within_the_bounded_wait() {
         let usb = ScriptedUsb::new(1, true);
@@ -483,7 +625,6 @@ mod tests {
         );
     }
 
-    /// A configuration that never sticks fails within the bounded wait.
     #[test]
     fn stuck_configuration_fails_within_the_bounded_wait() {
         let usb = ScriptedUsb::new(1, true);

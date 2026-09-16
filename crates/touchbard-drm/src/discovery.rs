@@ -1,16 +1,7 @@
 //! Hardware discovery, DRM-card discovery, and the flow that drives them.
 //!
-//! There are two *separate* discovery operations:
-//!
-//! - [`HardwareDiscovery`] answers "does the requested hardware, identified by
-//!   [`HardwareId`], actually exist?"
-//! - [`DrmCardDiscovery`] answers "has the kernel exposed a DRM card for that
-//!   already-discovered hardware?"
-//!
-//! [`discover_or_prepare`] runs them in that order. A missing DRM card only
-//! ever triggers a workaround when the hardware itself was found and that
-//! [`HardwareId`] has a known workaround ([`workaround_for`]). If the hardware
-//! is missing, no workaround is attempted and an unavailable error is returned.
+//! Hardware and DRM-card discovery are separate so hardware-specific
+//! preparation cannot be applied to unrelated devices.
 
 use std::error::Error;
 use std::path::PathBuf;
@@ -27,7 +18,6 @@ use crate::preparer::{workaround_for, DevicePreparer, HardwareId};
 /// are the caller's next operations.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DiscoveredDrmCard {
-    /// Absolute path to the DRM device node (e.g. `/dev/dri/card0`).
     pub device_path: PathBuf,
 }
 
@@ -39,8 +29,6 @@ pub struct DiscoveredDrmCard {
 /// The sysfs-backed implementation lives in [`crate::sysfs::SysfsHardwareDiscovery`],
 /// which scans the USB device tree for the id.
 pub trait HardwareDiscovery {
-    /// Locate the hardware with `id`, returning a token carrying its sysfs
-    /// path.
     fn find(&mut self, id: HardwareId) -> Result<HardwareDevice, Box<dyn Error + Send + Sync>>;
 }
 
@@ -69,42 +57,21 @@ pub struct HardwareDevice {
 /// hardware purely through the sysfs device tree - never a hardcoded card and
 /// never a driver name.
 pub trait DrmCardDiscovery {
-    /// Discover the DRM card associated with `hardware`.
     fn discover(
         &mut self,
         hardware: &HardwareDevice,
     ) -> Result<DiscoveredDrmCard, Box<dyn Error + Send + Sync>>;
 }
 
-/// How long to keep re-probing for the DRM card after a known workaround
-/// prepared the hardware. The workaround (e.g. a USB configuration switch)
-/// exposes the display interface asynchronously; discovery needs time to catch
-/// it.
+/// Maximum time to wait for a card after hardware preparation.
 const DRM_CARD_WAIT: Duration = Duration::from_secs(30);
-/// Poll interval while re-probing for the DRM card after a workaround.
 const DRM_CARD_POLL: Duration = Duration::from_millis(250);
+/// Reprobe interval for a prepared device whose card is still absent.
+const DRM_CARD_REPROBE: Duration = Duration::from_secs(2);
 
-/// Run the discovery flow:
-///
-/// ```text
-/// 1. find the target hardware by VID/PID
-///      └─ not found      → DRM unavailable (hardware not found); no workaround
-///      └─ found          → 2. find the DRM card for that hardware
-///                              └─ found    → DONE
-///                              └─ not found → 3. known workaround for this
-///                                                    HardwareId?
-///                                                   ├─ no  → DRM discovery failure
-///                                                   └─ yes → prepare, then find the
-///                                                            DRM card again
-///                                                               ├─ found    → DONE
-///                                                               └─ not found → DRM unavailable
-/// ```
-///
-/// A failed DRM-card discovery never *automatically* triggers a workaround:
-/// the target hardware must first be discovered, and only a [`HardwareId`]
-/// with a known workaround ([`workaround_for`]) gets one. For hardware without
-/// a known identity, only plain discovery runs. Unknown [`HardwareId`]s never
-/// trigger guessed behavior; the DRM discovery failure is returned.
+/// Find the hardware, apply a known preparation workaround, and discover its
+/// DRM card. Preparation may re-enumerate the hardware, so the sysfs token is
+/// refreshed before card discovery.
 pub fn discover_or_prepare<H, D>(
     hardware: &mut H,
     drm: &mut D,
@@ -124,11 +91,7 @@ where
     )
 }
 
-/// [`discover_or_prepare`] with the wait/poll and workaround lookup injected,
-/// so the orchestration is testable without DRM hardware and with short waits.
-///
-/// `pub(crate)` so the real sysfs discovery can be driven end-to-end against a
-/// fixture tree in [`crate::sysfs`] tests.
+/// Testable form of [`discover_or_prepare`] with injected timing and lookup.
 pub(crate) fn discover_or_prepare_with<H, D, R>(
     hardware: &mut H,
     drm: &mut D,
@@ -142,12 +105,9 @@ where
     D: DrmCardDiscovery,
     R: FnMut(HardwareId) -> Option<Box<dyn DevicePreparer>>,
 {
-    // Does the requested hardware exist?
     let device = match hardware.find(identity) {
         Ok(device) => device,
         Err(_) => {
-            // The workaround must NOT run: without the hardware, there is
-            // nothing to prepare. Report the hardware as unavailable.
             let msg = format!(
                 "DRM unavailable: target hardware {:04x}:{:04x} not found",
                 identity.vendor_id, identity.product_id
@@ -156,32 +116,29 @@ where
         }
     };
 
-    // Does the kernel expose a DRM card for that hardware?
-    match drm.discover(&device) {
-        Ok(card) => return Ok(card),
-        Err(card_err) => {
-            // The hardware exists but its DRM card is missing. A workaround is
-            // only considered for a *known* HardwareId; otherwise the failure
-            // is returned untouched.
-            let mut preparer = match resolve(identity) {
-                Some(preparer) => preparer,
-                None => return Err(card_err),
-            };
-
-            // Prepare the hardware, then re-probe for the DRM card until it
-            // appears or the bounded wait expires.
-            preparer.prepare()?;
-            let deadline = Instant::now() + wait;
-            loop {
-                match drm.discover(&device) {
-                    Ok(card) => return Ok(card),
-                    Err(_) if Instant::now() < deadline => {
-                        thread::sleep(poll);
+    if let Some(mut preparer) = resolve(identity) {
+        preparer.prepare()?;
+        let mut device = hardware.find(identity)?;
+        let deadline = Instant::now() + wait;
+        let mut next_reprobe = Instant::now();
+        loop {
+            match drm.discover(&device) {
+                Ok(card) => return Ok(card),
+                Err(error) if Instant::now() < deadline => {
+                    if Instant::now() >= next_reprobe {
+                        preparer.recover_no_card()?;
+                        device = hardware.find(identity)?;
+                        next_reprobe = Instant::now() + DRM_CARD_REPROBE;
+                    } else {
+                        eprintln!("DRM card discovery still pending; retrying: {error}");
                     }
-                    Err(retry_err) => return Err(retry_err),
+                    thread::sleep(poll);
                 }
+                Err(error) => return Err(error),
             }
         }
+    } else {
+        drm.discover(&device)
     }
 }
 
@@ -195,8 +152,6 @@ mod tests {
     use std::cell::RefCell;
     use std::rc::Rc;
 
-    /// A scripted hardware discovery: each `find` pops the next canned result,
-    /// and falls back to `tail_error` (if set) once the list is exhausted.
     struct FakeHardware {
         results: Vec<Result<HardwareDevice, String>>,
         tail_error: Option<String>,
@@ -227,12 +182,12 @@ mod tests {
         fn find(&mut self, id: HardwareId) -> Result<HardwareDevice, Box<dyn Error + Send + Sync>> {
             self.calls.borrow_mut().push(id);
             if self.results.is_empty() {
-                return Err(io_err(
-                    self.tail_error
-                        .clone()
-                        .unwrap_or_else(|| "unexpected extra find call".to_string()),
-                )
-                .into());
+                if let Some(error) = &self.tail_error {
+                    return Err(io_err(error.clone()).into());
+                }
+                return Ok(HardwareDevice {
+                    sysfs_path: PathBuf::from("/sys/fake/7-6"),
+                });
             }
             self.results
                 .drain(..1)
@@ -242,9 +197,6 @@ mod tests {
         }
     }
 
-    /// A scripted DRM-card discovery: each `discover` pops the next canned
-    /// result, falling back to `tail_error` once the list is exhausted, so
-    /// re-probing loops keep failing like real hardware.
     struct FakeDrmCards {
         results: Vec<Result<DiscoveredDrmCard, String>>,
         tail_error: Option<String>,
@@ -308,7 +260,6 @@ mod tests {
         }
     }
 
-    /// A scripted preparer that records its runs in a shared log.
     struct FakePreparer {
         log: Rc<RefCell<Vec<&'static str>>>,
         fail: bool,
@@ -323,6 +274,11 @@ mod tests {
                 Ok(())
             }
         }
+
+        fn recover_no_card(&mut self) -> Result<(), Box<dyn Error + Send + Sync>> {
+            self.log.borrow_mut().push("recover");
+            Ok(())
+        }
     }
 
     fn resolver(
@@ -330,8 +286,6 @@ mod tests {
         fail: bool,
     ) -> impl Fn(HardwareId) -> Option<Box<dyn DevicePreparer>> {
         move |id| {
-            // Model the real workaround table: only the known Touch Bar
-            // identity has a preparer; anything else resolves to None.
             if id == crate::touchbar::TOUCHBAR_ID {
                 Some(Box::new(FakePreparer {
                     log: Rc::clone(&log),
@@ -355,8 +309,6 @@ mod tests {
         );
     }
 
-    /// Hardware not found: DRM-card discovery is never attempted, the preparer
-    /// is never called, and the flow reports DRM unavailable.
     #[test]
     fn hardware_not_found_returns_unavailable_without_any_work() {
         let log: Rc<RefCell<Vec<&'static str>>> = Rc::new(RefCell::new(Vec::new()));
@@ -384,12 +336,9 @@ mod tests {
         assert_eq!(*drm.calls.borrow(), 0, "DRM-card discovery must not run");
         assert_never_ran(&log);
 
-        // The hardware discovery itself was asked once.
         assert_eq!(hardware.calls.borrow().len(), 1);
     }
 
-    /// Hardware found + DRM card found: the preparer is never called and the
-    /// discovered DRM card is returned.
     #[test]
     fn hardware_and_drm_card_found_needs_no_workaround() {
         let log: Rc<RefCell<Vec<&'static str>>> = Rc::new(RefCell::new(Vec::new()));
@@ -407,11 +356,10 @@ mod tests {
         .expect("hardware + card present");
         assert_eq!(card.device_path, PathBuf::from("/dev/dri/card0"));
         assert_eq!(*drm.calls.borrow(), 1);
-        assert_never_ran(&log);
+        assert_eq!(log.borrow().as_slice(), ["prepare"]);
+        assert_eq!(hardware.calls.borrow().len(), 2);
     }
 
-    /// Hardware found + DRM card missing + unknown HardwareId: no workaround
-    /// (the flow never guesses one) and the DRM discovery failure is returned.
     #[test]
     fn missing_card_with_unknown_identity_returns_drm_failure() {
         let log: Rc<RefCell<Vec<&'static str>>> = Rc::new(RefCell::new(Vec::new()));
@@ -436,14 +384,11 @@ mod tests {
         assert_never_ran(&log);
     }
 
-    /// Hardware found + DRM card missing + known HardwareId: the preparer is
-    /// called exactly once and DRM-card discovery is retried.
     #[test]
     fn missing_card_with_known_identity_runs_preparer_once_and_retries() {
         let log: Rc<RefCell<Vec<&'static str>>> = Rc::new(RefCell::new(Vec::new()));
         let mut hardware = FakeHardware::found();
         let mut drm = FakeDrmCards {
-            // 1 initial miss + 1 retry miss + success.
             results: vec![
                 Err("card not exposed yet".to_string()),
                 Err("card not exposed yet".to_string()),
@@ -471,14 +416,12 @@ mod tests {
         assert_eq!(card.device_path, PathBuf::from("/dev/dri/card3"));
         assert_eq!(
             log.borrow().as_slice(),
-            ["prepare"],
-            "prepared exactly once"
+            ["prepare", "recover"],
+            "prepared once and recovered once"
         );
         assert_eq!(*drm.calls.borrow(), 3, "initial + two retry probes");
     }
 
-    /// Hardware found + DRM card missing + known workaround + retry succeeds on
-    /// the first re-probe: return the discovered card.
     #[test]
     fn workaround_then_first_retry_succeeds() {
         let log: Rc<RefCell<Vec<&'static str>>> = Rc::new(RefCell::new(Vec::new()));
@@ -495,12 +438,10 @@ mod tests {
         )
         .expect("retry must find the card");
         assert_eq!(card.device_path, PathBuf::from("/dev/dri/card1"));
-        assert_eq!(log.borrow().as_slice(), ["prepare"]);
+        assert_eq!(log.borrow().as_slice(), ["prepare", "recover"]);
         assert_eq!(*drm.calls.borrow(), 2, "initial probe + one retry");
     }
 
-    /// Hardware found + DRM card missing + known workaround + retry always
-    /// fails: DRM unavailable (the last discovery failure is returned).
     #[test]
     fn workaround_then_retry_never_succeeds() {
         let log: Rc<RefCell<Vec<&'static str>>> = Rc::new(RefCell::new(Vec::new()));
@@ -521,11 +462,9 @@ mod tests {
         )
         .expect_err("retry must fail");
         assert_eq!(err.to_string(), "no card after preparation");
-        assert_eq!(log.borrow().as_slice(), ["prepare"]);
+        assert_eq!(log.borrow().as_slice(), ["prepare", "recover"]);
     }
 
-    /// A failing workaround fails the whole flow: the prep failure explains why
-    /// the hardware stayed without a DRM card.
     #[test]
     fn preparer_failure_is_returned() {
         let log: Rc<RefCell<Vec<&'static str>>> = Rc::new(RefCell::new(Vec::new()));
@@ -542,6 +481,6 @@ mod tests {
         )
         .expect_err("failed prep must propagate");
         assert_eq!(err.to_string(), "preparer exploded");
-        assert_eq!(*drm.calls.borrow(), 1, "only the initial probe ran");
+        assert_eq!(*drm.calls.borrow(), 0, "DRM probing waits for preparation");
     }
 }
