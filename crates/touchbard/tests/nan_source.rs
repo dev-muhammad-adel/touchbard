@@ -52,14 +52,14 @@ impl Rec {
     fn record(&mut self, transform: Affine, shape: &impl Shape) {
         self.draws += 1;
         if !transform.as_coeffs().iter().all(|v| v.is_finite()) {
-            self.non_finite.push((transform, vec![("TRANSFORM".into(), f64::NAN, 0.0)]));
+            self.non_finite
+                .push((transform, vec![("TRANSFORM".into(), f64::NAN, 0.0)]));
             return;
         }
         if is_circle(shape) {
             self.ball_circles += 1;
             let c = transform.as_coeffs();
-            self.ball_x
-                .push(c[4] + c[0] * shape.bounding_box().x0);
+            self.ball_x.push(c[4] + c[0] * shape.bounding_box().x0);
         }
         let path = shape.to_path(0.1);
         let els: Vec<_> = path.elements().iter().map(|&e| elt(e)).collect();
@@ -71,7 +71,13 @@ impl Rec {
 
 impl PaintScene for Rec {
     fn reset(&mut self) {}
-    fn push_layer(&mut self, _blend: impl Into<BlendMode>, _alpha: f32, t: Affine, clip: &impl Shape) {
+    fn push_layer(
+        &mut self,
+        _blend: impl Into<BlendMode>,
+        _alpha: f32,
+        t: Affine,
+        clip: &impl Shape,
+    ) {
         self.record(t, clip);
     }
     fn pop_layer(&mut self) {}
@@ -109,7 +115,15 @@ impl PaintScene for Rec {
         _glyphs: impl Iterator<Item = anyrender::Glyph>,
     ) {
     }
-    fn draw_box_shadow(&mut self, _transform: Affine, _rect: Rect, _brush: Color, _radius: f64, _std_dev: f64) {}
+    fn draw_box_shadow(
+        &mut self,
+        _transform: Affine,
+        _rect: Rect,
+        _brush: Color,
+        _radius: f64,
+        _std_dev: f64,
+    ) {
+    }
 }
 
 #[rustfmt::skip]
@@ -132,7 +146,11 @@ fn ball_app() -> Element {
 fn system() -> TouchbardSystem {
     TouchbardSystem::new(
         ball_app,
-        Viewport { width: 2008, height: 60, scale_factor: 1.0 },
+        Viewport {
+            width: 2008,
+            height: 60,
+            scale_factor: 1.0,
+        },
     )
 }
 
@@ -197,7 +215,11 @@ fn border_edges_with_real_widths_stay_finite() {
     }
     let mut sys = TouchbardSystem::new(
         bordered,
-        Viewport { width: 2008, height: 60, scale_factor: 1.0 },
+        Viewport {
+            width: 2008,
+            height: 60,
+            scale_factor: 1.0,
+        },
     );
     sys.poll();
     let rec = paint(&mut sys, 0.0, 1.0);

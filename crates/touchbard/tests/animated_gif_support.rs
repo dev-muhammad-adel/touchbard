@@ -30,7 +30,9 @@ fn count_color(data: &[u8], channel: usize) -> usize {
 fn color_summary(data: &[u8]) -> String {
     let mut colors = BTreeMap::new();
     for pixel in data.chunks_exact(4) {
-        *colors.entry([pixel[0], pixel[1], pixel[2], pixel[3]]).or_insert(0usize) += 1;
+        *colors
+            .entry([pixel[0], pixel[1], pixel[2], pixel[3]])
+            .or_insert(0usize) += 1;
     }
     colors
         .into_iter()
