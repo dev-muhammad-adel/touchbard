@@ -21,6 +21,18 @@ use tracing::trace;
 /// independent copy anywhere else.
 pub use touchbard_renderer::Viewport;
 
+/// Wall-clock in unix microseconds (`SystemTime`), the same epoch the renderer
+/// diagnostics use for its `wall_us` raster/geometry stamps (`cpu.rs`/`blitz`).
+/// `SystemTime` is process-global and comparable across threads, so a keyboard
+/// worker's `recv→set` stamp, this `frame()` entry stamp wenho and the renderer
+/// wall stamps all correlate directly in one CSV.
+fn wall_us() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_micros() as u64)
+        .unwrap_or(0)
+}
+
 /// The central runtime: a Dioxus `VirtualDom` integrated with a Blitz
 /// `BaseDocument`, plus a CPU (Vello) render pipeline.
 ///
@@ -202,6 +214,17 @@ impl TouchbardSystem {
     /// the first host-armed frame still renders. After that, presentation is
     /// strictly change-driven.
     pub fn frame(&mut self, wake: Option<&'static Waker>) -> Option<Frame> {
+        // Reactive-hop correlation (same wall clock as the example kbd stamps):
+        // this timestamp, one `Instant` in and out of `poll_with`, sits one hop
+        // after `latest.set` when typing. Post-hoc join to the keyboard example
+        // lines is valid because `Instant::now()` is a process-global clock
+        // comparable across the keyboard worker and the host thread.
+        if std::env::var("TOUCHBARD_DIAG").is_ok() {
+            eprintln!(
+                "[sys:frame] t_entry_wall_us={}",
+                wall_us()
+            );
+        }
         // Consume any redraw request and re-arm the host waker. This happens
         // *before* polling so a wake signalled by Dioxus during the poll is a
         // late answer to the frame we are about to produce, not a spurious one
@@ -214,6 +237,13 @@ impl TouchbardSystem {
             std::mem::take(&mut slot.requested)
         };
         let changed = self.poll_with(wake);
+        if std::env::var("TOUCHBARD_DIAG").is_ok() {
+            eprintln!(
+                "[sys:frame] poll_done_wall_us={} changed={}",
+                wall_us(),
+                changed
+            );
+        }
         let needs_initial_present = wake.is_some() && !self.presented_once;
         if !self.rendered || needs_initial_present || changed || requested || self.needs_redraw() {
             touchbard_renderer::diag::record(touchbard_renderer::diag::Ev::FrameStart {

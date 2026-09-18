@@ -1,12 +1,14 @@
-//! Keyboard input, gesture recognition, and reconnect lifecycle handling.
+//! Linux keyboard input with per-device readers, gesture recognition, udev
+//! hot-plug tracking, reconnect handling, and a logind suspend/resume
+//! lifecycle, delivered to subscribers as a unified [`KeyEvent`] stream.
 
 use std::collections::{HashMap, VecDeque};
 use std::fs;
 use std::io;
-use std::os::fd::{AsRawFd, OwnedFd};
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{mpsc, Arc, Mutex, OnceLock};
+use std::sync::{mpsc, Arc, Mutex, OnceLock, Weak};
 use std::task::{Context, Poll, Waker};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -15,9 +17,14 @@ const RECONNECT_DELAY: Duration = Duration::from_secs(3);
 const DOUBLE_PRESS_GAP: Duration = Duration::from_millis(350);
 const LONG_PRESS_DURATION: Duration = Duration::from_millis(500);
 const WORKER_TICK: Duration = Duration::from_millis(50);
-const DISCOVERY_INTERVAL: Duration = Duration::from_millis(250);
+// Confirmation window after an ENOBUFS overflow. It is a short reconciliation
+// checkpoint only, never a device-readiness or resume-completion deadline.
+const UEVENT_CONFIRM_DELAY: Duration = Duration::from_millis(250);
+const UEVENT_BUFFER_SIZE: usize = 8192;
+const UEVENT_RECV_BUFFER: usize = 1 << 20;
+const NETLINK_KOBJECT_UEVENT: libc::c_int = 15;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Key {
     Fn,
     Escape,
@@ -33,6 +40,7 @@ pub enum Key {
     RAlt,
     Meta,
     RMeta,
+    CapsLock,
     F(u8),
     Up,
     Down,
@@ -56,6 +64,8 @@ pub enum Key {
     KeyboardIlluminationUp,
     MicMute,
     Letter(char),
+    Digit(u8),
+    Character(char),
     Unknown(u16),
 }
 
@@ -76,9 +86,11 @@ impl Key {
             100 => Self::RAlt,
             125 => Self::Meta,
             126 => Self::RMeta,
+            58 => Self::CapsLock,
             59..=68 => Self::F((code - 58) as u8),
             87 => Self::F(11),
             88 => Self::F(12),
+            183..=194 => Self::F((code - 170) as u8),
             103 => Self::Up,
             108 => Self::Down,
             105 => Self::Left,
@@ -100,6 +112,18 @@ impl Key {
             229 => Self::KeyboardIlluminationDown,
             230 => Self::KeyboardIlluminationUp,
             248 => Self::MicMute,
+            2..=10 => Self::Digit((code - 1) as u8),
+            11 => Self::Digit(0),
+            71 => Self::Digit(7),
+            72 => Self::Digit(8),
+            73 => Self::Digit(9),
+            75 => Self::Digit(4),
+            76 => Self::Digit(5),
+            77 => Self::Digit(6),
+            79 => Self::Digit(1),
+            80 => Self::Digit(2),
+            81 => Self::Digit(3),
+            82 => Self::Digit(0),
             16 => Self::Letter('q'),
             17 => Self::Letter('w'),
             18 => Self::Letter('e'),
@@ -126,7 +150,25 @@ impl Key {
             48 => Self::Letter('b'),
             49 => Self::Letter('n'),
             50 => Self::Letter('m'),
-            _ => Self::Unknown(code),
+            41 => Self::Character('`'),
+            12 => Self::Character('-'),
+            13 => Self::Character('='),
+            26 => Self::Character('['),
+            27 => Self::Character(']'),
+            43 => Self::Character('\\'),
+            39 => Self::Character(';'),
+            40 => Self::Character('\''),
+            51 => Self::Character(','),
+            52 => Self::Character('.'),
+            53 => Self::Character('/'),
+            83 => Self::Character('.'),
+            89 => Self::Character('-'),
+            90 => Self::Character('+'),
+            91 => Self::Character('*'),
+            93 => Self::Character('/'),
+            86 => Self::Character('<'),
+            96 => Self::Enter,
+            code => Self::Unknown(code),
         }
     }
 }
@@ -135,6 +177,7 @@ impl Key {
 pub enum KeyGesture {
     Press,
     LongPress,
+    Release,
     DoublePress,
 }
 
@@ -151,12 +194,33 @@ struct HeldKey {
     long_fired: bool,
 }
 
+/// Per-key gesture recognition for a single keyboard device.
+///
+/// Gesture semantics, applied independently to every key:
+///
+/// - [`Press`](KeyGesture::Press) is emitted the moment a key goes down. A
+///   second down event for an already-held key is ignored.
+/// - [`LongPress`](KeyGesture::LongPress) is emitted exactly once, at the
+///   first tick on or after `long_duration` for which the key is still held.
+///   It fires while the key is still physically down; it never waits for the
+///   key-up.
+/// - [`Release`](KeyGesture::Release) is emitted on the physical key-up of a
+///   held key. It is never synthesized by a timer tick.
+/// - [`DoublePress`](KeyGesture::DoublePress) is emitted on the second release
+///   of the same key when the two releases are at most `double_gap` apart, and
+///   is always accompanied by the physical
+///   [`Release`](KeyGesture::Release) for that key-up. A release after a
+///   `LongPress` never produces a `DoublePress`. After a `DoublePress` the
+///   key's release history resets, so the next sequence starts fresh.
+///
+/// Timing uses the monotonic clock. State is fully independent per key and per
+/// recognizer, so multiple devices and overlapping holds never interact.
 #[derive(Debug)]
 pub struct GestureRecognizer {
     double_gap: Duration,
     long_duration: Duration,
-    held: Option<HeldKey>,
-    last_release: Option<(Key, Instant)>,
+    held: HashMap<Key, HeldKey>,
+    last_release: HashMap<Key, Instant>,
 }
 
 impl Default for GestureRecognizer {
@@ -170,8 +234,8 @@ impl GestureRecognizer {
         Self {
             double_gap,
             long_duration,
-            held: None,
-            last_release: None,
+            held: HashMap::new(),
+            last_release: HashMap::new(),
         }
     }
 
@@ -184,63 +248,81 @@ impl GestureRecognizer {
     }
 
     pub fn advance(&mut self, now: Instant) -> Vec<KeyEvent> {
-        let Some(held) = self.held.as_mut() else {
-            return Vec::new();
-        };
-        if !held.long_fired && now.duration_since(held.pressed_at) >= self.long_duration {
-            held.long_fired = true;
-            return vec![KeyEvent {
-                key: held.key,
-                gesture: KeyGesture::LongPress,
-            }];
+        let mut due: Vec<(Instant, KeyEvent)> = Vec::new();
+        for held in self.held.values_mut() {
+            if !held.long_fired
+                && now.saturating_duration_since(held.pressed_at) >= self.long_duration
+            {
+                held.long_fired = true;
+                due.push((
+                    held.pressed_at,
+                    KeyEvent {
+                        key: held.key,
+                        gesture: KeyGesture::LongPress,
+                    },
+                ));
+            }
         }
-        Vec::new()
+        due.sort_by_key(|(pressed_at, event)| (*pressed_at, event.key));
+        due.into_iter().map(|(_, event)| event).collect()
     }
 
     pub fn clear(&mut self) {
-        self.held = None;
-        self.last_release = None;
+        self.held.clear();
+        self.last_release.clear();
     }
 
     fn press(&mut self, key: Key, now: Instant) -> Vec<KeyEvent> {
         let mut events = self.advance(now);
-        self.held = Some(HeldKey {
-            key,
-            pressed_at: now,
-            long_fired: false,
-        });
-        events.push(KeyEvent {
-            key,
-            gesture: KeyGesture::Press,
-        });
+        if !self.held.contains_key(&key) {
+            self.held.insert(
+                key,
+                HeldKey {
+                    key,
+                    pressed_at: now,
+                    long_fired: false,
+                },
+            );
+            events.push(KeyEvent {
+                key,
+                gesture: KeyGesture::Press,
+            });
+        }
         events
     }
 
     fn release(&mut self, key: Key, now: Instant) -> Vec<KeyEvent> {
-        let Some(held) = self.held.take() else {
+        // A key-up only reports the trackable physical key; an untracked
+        // release is ignored.
+        let Some(held) = self.held.remove(&key) else {
             return Vec::new();
         };
-        if held.key != key {
-            self.clear();
-            return Vec::new();
-        }
+        let mut events = vec![KeyEvent {
+            key,
+            gesture: KeyGesture::Release,
+        }];
         if held.long_fired {
-            self.last_release = None;
-            return Vec::new();
+            // A hold that crossed the long-press threshold never factors into
+            // double-press detection: its release is reported but not recorded
+            // as a pairing candidate.
+            self.last_release.remove(&key);
+            return events;
         }
         let double = self
             .last_release
-            .filter(|(last_key, at)| *last_key == key && now.duration_since(*at) <= self.double_gap)
-            .is_some();
-        self.last_release = if double { None } else { Some((key, now)) };
+            .get(&key)
+            .map(|release_at| now.saturating_duration_since(*release_at) <= self.double_gap)
+            .unwrap_or(false);
         if double {
-            vec![KeyEvent {
+            self.last_release.remove(&key);
+            events.push(KeyEvent {
                 key,
                 gesture: KeyGesture::DoublePress,
-            }]
+            });
         } else {
-            Vec::new()
+            self.last_release.insert(key, now);
         }
+        events
     }
 }
 
@@ -280,6 +362,10 @@ struct SubscriptionState {
     closed: bool,
 }
 
+// The registry holds weak references so that a dropped subscription is pruned
+// on the next publish or subscribe instead of being retained forever.
+type Subscribers = Arc<Mutex<Vec<Weak<Mutex<SubscriptionState>>>>>;
+
 #[derive(Clone)]
 pub struct Keyboard {
     inner: Arc<KeyboardInner>,
@@ -287,7 +373,7 @@ pub struct Keyboard {
 
 struct KeyboardInner {
     commands: mpsc::Sender<Command>,
-    subscribers: Arc<Mutex<Vec<Arc<Mutex<SubscriptionState>>>>>,
+    subscribers: Subscribers,
     stopped: AtomicBool,
     worker: Mutex<Option<thread::JoinHandle<()>>>,
     lifecycle: Mutex<Option<LifecycleWatcher>>,
@@ -303,13 +389,6 @@ enum Command {
 enum ReaderState {
     Waiting(Instant),
     Ready,
-    Suspended,
-}
-
-struct DeviceState {
-    fd: Option<OwnedFd>,
-    recognizer: GestureRecognizer,
-    state: ReaderState,
 }
 
 impl ReaderState {
@@ -318,15 +397,18 @@ impl ReaderState {
     }
 
     fn disconnected(self, now: Instant) -> Self {
-        match self {
-            Self::Suspended => Self::Suspended,
-            Self::Waiting(_) | Self::Ready => Self::Waiting(now + RECONNECT_DELAY),
-        }
+        Self::Waiting(now + RECONNECT_DELAY)
     }
 
     fn should_reconnect(self, now: Instant) -> bool {
-        matches!(self, Self::Waiting(at) if now >= at)
+        matches!(self, Self::Waiting(deadline) if now >= deadline)
     }
+}
+
+struct DeviceState {
+    fd: Option<OwnedFd>,
+    recognizer: GestureRecognizer,
+    state: ReaderState,
 }
 
 impl Keyboard {
@@ -337,7 +419,7 @@ impl Keyboard {
 
     pub fn new() -> Self {
         let (commands, command_rx) = mpsc::channel();
-        let subscribers = Arc::new(Mutex::new(Vec::new()));
+        let subscribers: Subscribers = Arc::new(Mutex::new(Vec::new()));
         let worker_subscribers = Arc::clone(&subscribers);
         let worker = thread::Builder::new()
             .name("touchbard-keyboard".into())
@@ -362,7 +444,8 @@ impl Keyboard {
             closed: false,
         }));
         if let Ok(mut subscribers) = self.inner.subscribers.lock() {
-            subscribers.push(Arc::clone(&state));
+            subscribers.retain(|slot| slot.strong_count() > 0);
+            subscribers.push(Arc::downgrade(&state));
         }
         KeyboardSubscription { state }
     }
@@ -402,8 +485,12 @@ impl Drop for KeyboardInner {
             }
         }
         if let Ok(subscribers) = self.subscribers.lock() {
-            for subscriber in subscribers.iter() {
-                if let Ok(mut state) = subscriber.lock() {
+            let states: Vec<_> = subscribers
+                .iter()
+                .filter_map(|slot| slot.upgrade())
+                .collect();
+            for state in states {
+                if let Ok(mut state) = state.lock() {
                     state.closed = true;
                     if let Some(waker) = state.waker.take() {
                         waker.wake();
@@ -419,42 +506,335 @@ impl Drop for KeyboardInner {
     }
 }
 
-fn run_worker(
-    commands: mpsc::Receiver<Command>,
-    subscribers: Arc<Mutex<Vec<Arc<Mutex<SubscriptionState>>>>>,
-) {
-    let mut devices = HashMap::<PathBuf, DeviceState>::new();
-    let mut suspended = false;
-    let mut next_discovery = Instant::now();
+struct UeventSocket {
+    fd: OwnedFd,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RecvError {
+    Interrupted,
+    Overflow,
+    WouldBlock,
+    Other,
+}
+
+#[derive(Debug)]
+struct Uevent {
+    action: String,
+    subsystem: Option<String>,
+    /// Authoritative kernel device path from the `DEVPATH=` field, when the
+    /// kernel includes it in the uevent payload. Prefer this over any path
+    /// derived from the `@` prefix or from a `DEVNAME=` reconstruction.
+    devpath: Option<String>,
+}
+
+struct UeventDrain {
+    events: Vec<Uevent>,
+    overflow: bool,
+}
+
+impl UeventSocket {
+    fn open() -> io::Result<Self> {
+        let sock = unsafe {
+            libc::socket(
+                libc::AF_NETLINK,
+                libc::SOCK_RAW | libc::SOCK_CLOEXEC,
+                NETLINK_KOBJECT_UEVENT,
+            )
+        };
+        if sock < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let fd = unsafe {
+            // `nl_pad` is a private field in libc 0.2.185+, so the whole
+            // address is zeroed before filling in the family and groups.
+            let mut address: libc::sockaddr_nl = std::mem::zeroed();
+            address.nl_family = libc::AF_NETLINK as libc::sa_family_t;
+            address.nl_groups = u32::MAX;
+            if libc::bind(
+                sock,
+                &address as *const libc::sockaddr_nl as *const libc::sockaddr,
+                std::mem::size_of::<libc::sockaddr_nl>() as libc::socklen_t,
+            ) < 0
+            {
+                let error = io::Error::last_os_error();
+                libc::close(sock);
+                return Err(error);
+            }
+            // The kernel doubles the requested value, and a second call would
+            // only reset the buffer the first call sized. SO_RCVBUFFORCE
+            // bypasses net.core.rmem_max but requires CAP_NET_ADMIN; without
+            // it (EPERM) fall back to SO_RCVBUF, which the kernel clamps.
+            let recv_buffer = UEVENT_RECV_BUFFER as libc::c_int;
+            let recv_len = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
+            if libc::setsockopt(
+                sock,
+                libc::SOL_SOCKET,
+                libc::SO_RCVBUFFORCE,
+                (&recv_buffer as *const libc::c_int).cast(),
+                recv_len,
+            ) < 0
+            {
+                libc::setsockopt(
+                    sock,
+                    libc::SOL_SOCKET,
+                    libc::SO_RCVBUF,
+                    (&recv_buffer as *const libc::c_int).cast(),
+                    recv_len,
+                );
+            }
+            let mut actual: libc::c_int = 0;
+            let mut actual_len = recv_len;
+            libc::getsockopt(
+                sock,
+                libc::SOL_SOCKET,
+                libc::SO_RCVBUF,
+                (&mut actual as *mut libc::c_int).cast(),
+                &mut actual_len,
+            );
+            tracing::debug!(
+                requested = recv_buffer,
+                actual,
+                "keyboard discovery uevent socket receive buffer"
+            );
+            OwnedFd::from_raw_fd(sock)
+        };
+        Ok(Self { fd })
+    }
+
+    fn drain_input_events(&self) -> UeventDrain {
+        let mut buffer = [0u8; UEVENT_BUFFER_SIZE];
+        let mut drain = UeventDrain {
+            events: Vec::new(),
+            overflow: false,
+        };
+        loop {
+            let received = unsafe {
+                libc::recv(
+                    self.fd.as_raw_fd(),
+                    buffer.as_mut_ptr().cast(),
+                    buffer.len(),
+                    libc::MSG_DONTWAIT,
+                )
+            };
+            if received < 0 {
+                let error = io::Error::last_os_error();
+                match classify_uevent_recv_error(&error) {
+                    RecvError::Interrupted => continue,
+                    RecvError::Overflow => {
+                        // The kernel dropped uevents because the receive buffer
+                        // overflowed. The caller must reconcile against
+                        // authoritative udev state instead of silently missing
+                        // hot-plug transitions.
+                        drain.overflow = true;
+                        return drain;
+                    }
+                    RecvError::WouldBlock => return drain,
+                    RecvError::Other => {
+                        tracing::warn!(error = %error, "keyboard discovery uevent socket read failed");
+                        return drain;
+                    }
+                }
+            }
+            let received = received as usize;
+            if received == 0 {
+                return drain;
+            }
+            if let Some(event) = parse_uevent(&buffer[..received]) {
+                if event.subsystem.as_deref() == Some("input") {
+                    drain.events.push(event);
+                }
+            }
+        }
+    }
+}
+
+fn classify_uevent_recv_error(error: &io::Error) -> RecvError {
+    match error.raw_os_error() {
+        Some(code) if code == libc::EINTR => RecvError::Interrupted,
+        Some(code) if code == libc::ENOBUFS => RecvError::Overflow,
+        _ if error.kind() == io::ErrorKind::WouldBlock => RecvError::WouldBlock,
+        _ => RecvError::Other,
+    }
+}
+
+fn parse_uevent(buffer: &[u8]) -> Option<Uevent> {
+    // NETLINK_KOBJECT_UEVENT datagrams carry no netlink (nlmsghdr) header:
+    // the payload begins directly with the kernel uevent prefix word, e.g.
+    // `remove@/devices/pci0000:00/...`, NUL-terminated, followed by
+    // NUL-separated `KEY=VALUE` fields. Nothing is stripped before parsing.
+    let prefix_end = buffer.iter().position(|&byte| byte == 0)?;
+    let prefix = std::str::from_utf8(&buffer[..prefix_end]).ok()?;
+    // The prefix word is `action@/devices/...`; the action fragment is used
+    // only as a fallback since the `ACTION=` field is authoritative.
+    let mut action = prefix.split('@').next().unwrap_or(prefix).to_string();
+    let mut subsystem = None;
+    let mut devpath = None;
+    let mut rest = &buffer[prefix_end + 1..];
+    while let Some(field_end) = rest.iter().position(|&byte| byte == 0) {
+        let field = &rest[..field_end];
+        if let Some(equal) = field.iter().position(|&byte| byte == b'=') {
+            let value = std::str::from_utf8(&field[equal + 1..]).ok();
+            match (&field[..equal], value) {
+                (b"ACTION", Some(value)) => action = value.to_string(),
+                (b"SUBSYSTEM", Some(value)) => subsystem = Some(value.to_string()),
+                (b"DEVPATH", Some(value)) => devpath = Some(value.to_string()),
+                _ => {}
+            }
+        }
+        rest = &rest[field_end + 1..];
+        if rest.is_empty() {
+            break;
+        }
+    }
+    Some(Uevent {
+        action,
+        subsystem,
+        devpath,
+    })
+}
+
+fn devpath_to_dev_path(devpath: &str) -> Option<PathBuf> {
+    // Consumes the authoritative `DEVPATH=` value (e.g.
+    // `/devices/.../input/input11/event11`) directly. The device is
+    // identified by its terminal `eventN` fragment, which is the same
+    // fragment the discovery pass used to key the `devices` map; the map key
+    // is therefore derived from DEVPATH directly, never rebuilt from the
+    // `action@/devices/...` prefix word.
+    devpath
+        .split('/')
+        .find(|part| part.starts_with("event"))
+        .map(|name| PathBuf::from(format!("/dev/input/{name}")))
+}
+
+fn remove_uevent_device(devices: &mut HashMap<PathBuf, DeviceState>, devpath: &str) -> bool {
+    let Some(path) = devpath_to_dev_path(devpath) else {
+        return false;
+    };
+    if devices.remove(&path).is_some() {
+        tracing::info!(path = %path.display(), "keyboard input reader removed");
+        true
+    } else {
+        false
+    }
+}
+
+struct WorkerState {
+    devices: HashMap<PathBuf, DeviceState>,
+    suspended: bool,
+    confirm_discovery: Option<Instant>,
+    discover: Box<dyn Fn() -> Vec<PathBuf>>,
+}
+
+impl WorkerState {
+    fn new(discover: impl Fn() -> Vec<PathBuf> + 'static) -> Self {
+        Self {
+            devices: HashMap::new(),
+            suspended: false,
+            confirm_discovery: None,
+            discover: Box::new(discover),
+        }
+    }
+
+    fn rescan(&mut self, now: Instant) {
+        add_discovered(&mut self.devices, (self.discover)(), now);
+    }
+
+    fn reconcile(&mut self, now: Instant) {
+        let found = (self.discover)();
+        self.devices.retain(|path, _| found.contains(path));
+        add_discovered(&mut self.devices, found, now);
+    }
+
+    fn suspend(&mut self) {
+        self.suspended = true;
+        self.devices.clear();
+    }
+
+    fn resume(&mut self, now: Instant) {
+        self.suspended = false;
+        self.devices.clear();
+        self.confirm_discovery = Some(now);
+    }
+
+    fn maybe_confirm(&mut self, now: Instant) {
+        if let Some(confirm_at) = self.confirm_discovery {
+            if now >= confirm_at {
+                self.rescan(now);
+                self.confirm_discovery = None;
+            }
+        }
+    }
+
+    fn handle_uevent(&mut self, event: &Uevent, now: Instant) {
+        match event.action.as_str() {
+            "add" | "move" | "bind" => self.rescan(now),
+            "remove" => {
+                // DEVPATH= is authoritative and is REQUIRED for removal. It
+                // is consumed directly: the value is routed to the
+                // `/dev/input/eventN` map key through `devpath_to_dev_path`.
+                // DEVPATH is never rebuilt from the `remove@...` prefix word,
+                // and DEVNAME= is never used for removal. A remove uevent
+                // that omits DEVPATH= is incomplete/invalid and is safely
+                // ignored/rejected: no device path is reconstructed from the
+                // `remove@...` prefix word or from DEVNAME=.
+                if let Some(devpath) = event.devpath.as_deref() {
+                    remove_uevent_device(&mut self.devices, devpath);
+                }
+                self.rescan(now);
+            }
+            _ => {}
+        }
+        self.confirm_discovery = Some(now + UEVENT_CONFIRM_DELAY);
+    }
+}
+
+fn process_uevent_drain(state: &mut WorkerState, drain: UeventDrain, now: Instant) {
+    if drain.overflow {
+        tracing::warn!(
+            "keyboard discovery uevent socket overflowed; reconciling keyboard device state"
+        );
+        state.reconcile(now);
+        state.confirm_discovery = Some(now + UEVENT_CONFIRM_DELAY);
+    }
+    for event in drain.events {
+        state.handle_uevent(&event, now);
+    }
+}
+
+fn run_worker(commands: mpsc::Receiver<Command>, subscribers: Subscribers) {
+    let mut uevent = match UeventSocket::open() {
+        Ok(socket) => Some(socket),
+        Err(error) => {
+            tracing::error!(error = %error, "keyboard discovery uevent socket unavailable; hot-plug detection disabled");
+            None
+        }
+    };
+    let mut state = WorkerState::new(find_keyboard_devices);
+    state.rescan(Instant::now());
     loop {
         while let Ok(command) = commands.try_recv() {
             match command {
                 Command::Suspend => {
-                    tracing::info!("keyboard suspend: releasing input device and clearing state");
-                    suspended = true;
-                    devices.clear();
+                    tracing::info!("keyboard suspend: releasing input devices and clearing state");
+                    state.suspend();
                 }
                 Command::Resume => {
-                    tracing::info!("keyboard resume: rediscovering input device");
-                    suspended = false;
-                    devices.clear();
-                    next_discovery = Instant::now();
+                    tracing::info!("keyboard resume: rediscovering input devices");
+                    state.resume(Instant::now());
                 }
                 Command::Stop => return,
             }
         }
-        if suspended {
+        if state.suspended {
             thread::sleep(WORKER_TICK);
             continue;
         }
 
-        let now = Instant::now();
-        if now >= next_discovery {
-            add_discovered(&mut devices, find_keyboard_devices(), now);
-            next_discovery = now + DISCOVERY_INTERVAL;
-        }
+        state.maybe_confirm(Instant::now());
 
-        for (path, device) in devices.iter_mut() {
+        let now = Instant::now();
+        for (path, device) in state.devices.iter_mut() {
             if device.fd.is_none() && device.state.should_reconnect(now) {
                 match open_keyboard(path) {
                     Ok(opened) => {
@@ -471,16 +851,13 @@ fn run_worker(
             }
         }
 
-        let pollable: Vec<_> = devices
+        let pollable: Vec<_> = state
+            .devices
             .iter()
             .filter_map(|(path, device)| {
                 device.fd.as_ref().map(|fd| (path.clone(), fd.as_raw_fd()))
             })
             .collect();
-        if pollable.is_empty() {
-            thread::sleep(WORKER_TICK);
-            continue;
-        }
         let mut pollfds: Vec<_> = pollable
             .iter()
             .map(|(_, fd)| libc::pollfd {
@@ -489,6 +866,21 @@ fn run_worker(
                 revents: 0,
             })
             .collect();
+        let uevent_offset = usize::from(uevent.is_some());
+        if uevent.is_some() {
+            pollfds.insert(
+                0,
+                libc::pollfd {
+                    fd: uevent.as_ref().unwrap().fd.as_raw_fd(),
+                    events: libc::POLLIN,
+                    revents: 0,
+                },
+            );
+        }
+        if pollfds.is_empty() {
+            thread::sleep(WORKER_TICK);
+            continue;
+        }
         let result = unsafe {
             libc::poll(
                 pollfds.as_mut_ptr(),
@@ -497,21 +889,52 @@ fn run_worker(
             )
         };
         if result < 0 {
-            for (path, _) in &pollable {
-                mark_failed(&mut devices, path);
+            let error = io::Error::last_os_error();
+            if error.raw_os_error() != Some(libc::EINTR) {
+                tracing::warn!(error = %error, "keyboard poll failed; marking readers failed");
+                for (path, _) in &pollable {
+                    mark_failed(&mut state.devices, path);
+                }
+                state.reconcile(Instant::now());
+                state.confirm_discovery = Some(Instant::now() + UEVENT_CONFIRM_DELAY);
             }
-        } else {
-            for ((path, _), pollfd) in pollable.iter().zip(pollfds) {
+        } else if result > 0 {
+            let now = Instant::now();
+            let uevent_revents = if uevent.is_some() {
+                pollfds[0].revents
+            } else {
+                0
+            };
+            if uevent_revents & (libc::POLLIN | libc::POLLERR | libc::POLLHUP | libc::POLLNVAL) != 0
+            {
+                if let Some(socket) = uevent.as_ref() {
+                    let drain = socket.drain_input_events();
+                    process_uevent_drain(&mut state, drain, now);
+                }
+            }
+            if uevent_revents & (libc::POLLERR | libc::POLLHUP | libc::POLLNVAL) != 0 {
+                tracing::warn!("keyboard discovery uevent socket failed; reopening");
+                uevent = None;
+                match UeventSocket::open() {
+                    Ok(socket) => uevent = Some(socket),
+                    Err(error) => {
+                        tracing::error!(error = %error, "keyboard discovery uevent socket unavailable; hot-plug detection disabled")
+                    }
+                }
+                state.reconcile(now);
+                state.confirm_discovery = Some(now + UEVENT_CONFIRM_DELAY);
+            }
+            for ((path, _), pollfd) in pollable.iter().zip(pollfds.iter().skip(uevent_offset)) {
                 if pollfd.revents & (libc::POLLERR | libc::POLLHUP | libc::POLLNVAL) != 0 {
                     tracing::warn!(path = %path.display(), "keyboard input reader lost the device; retrying");
-                    mark_failed(&mut devices, path);
+                    mark_failed(&mut state.devices, path);
                 } else if pollfd.revents & libc::POLLIN != 0 {
-                    read_device(&mut devices, path, &subscribers);
+                    read_device(&mut state.devices, path, &subscribers);
                 }
             }
         }
         let now = Instant::now();
-        for device in devices.values_mut() {
+        for device in state.devices.values_mut() {
             publish(&subscribers, device.recognizer.advance(now));
         }
     }
@@ -542,7 +965,7 @@ fn mark_failed(devices: &mut HashMap<PathBuf, DeviceState>, path: &Path) {
 fn read_device(
     devices: &mut HashMap<PathBuf, DeviceState>,
     path: &Path,
-    subscribers: &Arc<Mutex<Vec<Arc<Mutex<SubscriptionState>>>>>,
+    subscribers: &Subscribers,
 ) {
     let Some(device) = devices.get_mut(path) else {
         return;
@@ -558,8 +981,15 @@ fn read_device(
             std::mem::size_of::<InputEvent>(),
         )
     };
-    if read != std::mem::size_of::<InputEvent>() as isize {
-        tracing::warn!(path = %path.display(), "keyboard input reader failed to read a complete event; retrying");
+    if read < 0 {
+        let error = io::Error::last_os_error();
+        if error.kind() == io::ErrorKind::WouldBlock {
+            return;
+        }
+        tracing::warn!(path = %path.display(), error = %error, "failed to read a keyboard input event; retrying");
+        mark_failed(devices, path);
+    } else if read != std::mem::size_of::<InputEvent>() as isize {
+        tracing::warn!(path = %path.display(), "failed to read a complete keyboard input event; retrying");
         mark_failed(devices, path);
     } else if event.event_type == EV_KEY {
         publish(
@@ -571,25 +1001,40 @@ fn read_device(
     }
 }
 
-fn publish(subscribers: &Arc<Mutex<Vec<Arc<Mutex<SubscriptionState>>>>>, events: Vec<KeyEvent>) {
+fn publish(subscribers: &Subscribers, events: Vec<KeyEvent>) {
     if events.is_empty() {
         return;
     }
     for event in &events {
         tracing::info!(key = ?event.key, gesture = ?event.gesture, "keyboard event");
     }
-    if let Ok(subscribers) = subscribers.lock() {
-        for subscriber in subscribers.iter() {
-            if let Ok(mut state) = subscriber.lock() {
-                state.events.extend(events.iter().copied());
-                if let Some(waker) = state.waker.take() {
-                    waker.wake();
-                }
+    let states: Vec<_> = subscribers
+        .lock()
+        .map(|subscribers| subscribers.iter().filter_map(Weak::upgrade).collect())
+        .unwrap_or_default();
+    for state in &states {
+        if let Ok(mut state) = state.lock() {
+            // Latest-wins: keep only the newest event. A consumer on the UI
+            // thread polls until `recv()` returns Pending; an unbounded backlog
+            // would keep the Dioxus scheduler's `render_immediate` loop hot
+            // (each `recv` is Ready, each signal write re-queues work), so a
+            // producer flood could starve presentation. Coalescing to one event
+            // guarantees the consumer drains to Pending after every wake. The
+            // stream is a key-state feed, so older events are stale by design.
+            state.events.clear();
+            state.events.push_back(*events.last().unwrap());
+            if let Some(waker) = state.waker.take() {
+                waker.wake();
             }
         }
     }
+    if let Ok(mut subscribers) = subscribers.lock() {
+        subscribers.retain(|slot| slot.strong_count() > 0);
+    }
 }
 
+// Mirrors the kernel's `struct input_event` layout so one read on an evdev
+// node yields exactly one event.
 #[repr(C)]
 #[derive(Default)]
 struct InputEvent {
@@ -602,13 +1047,18 @@ struct InputEvent {
 const EV_KEY: u16 = 0x01;
 
 fn open_keyboard(path: &Path) -> io::Result<OwnedFd> {
-    let file = fs::OpenOptions::new().read(true).open(&path)?;
+    let file = fs::OpenOptions::new().read(true).open(path)?;
+    // Best-effort non-blocking so a wedged device can never stall the worker;
+    // evdev reads deliver whole events, so an early EAGAIN is simply skipped.
+    unsafe {
+        libc::fcntl(file.as_raw_fd(), libc::F_SETFL, libc::O_NONBLOCK);
+    }
     Ok(file.into())
 }
 
 fn find_keyboard_devices() -> Vec<PathBuf> {
     let input = Path::new("/sys/class/input");
-    let mut devices = Vec::<(i32, PathBuf)>::new();
+    let mut devices = Vec::new();
     let Ok(entries) = fs::read_dir(input) else {
         return Vec::new();
     };
@@ -641,23 +1091,9 @@ fn find_keyboard_devices() -> Vec<PathBuf> {
         {
             continue;
         }
-        let score = if bridge_matches(&sysfs) { 60 } else { 10 };
-        devices.push((score, PathBuf::from(format!("/dev/input/{name}"))));
+        devices.push(PathBuf::from(format!("/dev/input/{name}")));
     }
-    devices.sort_by_key(|(score, path)| (-*score, path.clone()));
-    devices.into_iter().map(|(_, path)| path).collect()
-}
-
-fn bridge_matches(path: &Path) -> bool {
-    let path = path.to_string_lossy();
-    if let Ok(bridges) = std::env::var("REACT_DRM_USB_BRIDGE") {
-        return bridges
-            .split(',')
-            .map(str::trim)
-            .filter(|bridge| !bridge.is_empty())
-            .any(|bridge| path.contains(bridge));
-    }
-    path.contains("apple-bce") || path.contains("bce-vhci")
+    devices
 }
 
 struct LifecycleWatcher {
@@ -731,132 +1167,515 @@ impl LifecycleWatcher {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::PathBuf as Pb;
 
-    const KEY: Key = Key::Space;
-    fn at(start: Instant, ms: u64) -> Instant {
+    /// Deterministic monotonic clock: offsets from a fixed instant.
+    fn at_ms(start: Instant, ms: u64) -> Instant {
         start + Duration::from_millis(ms)
     }
 
-    #[test]
-    fn press_emits_once_and_repeat_is_ignored() {
-        let start = Instant::now();
-        let mut recognizer = GestureRecognizer::default();
+    fn base() -> Instant {
+        Instant::now()
+    }
+
+    fn press(rec: &mut GestureRecognizer, key: Key, start: Instant, at: u64) -> Vec<KeyEvent> {
+        rec.input(key, 1, at_ms(start, at))
+    }
+
+    fn release(rec: &mut GestureRecognizer, key: Key, start: Instant, at: u64) -> Vec<KeyEvent> {
+        rec.input(key, 0, at_ms(start, at))
+    }
+
+    fn assert_press(events: &[KeyEvent], key: Key) {
         assert_eq!(
-            recognizer.input(KEY, 1, start)[0].gesture,
-            KeyGesture::Press
+            events,
+            &[KeyEvent {
+                key,
+                gesture: KeyGesture::Press,
+            }]
         );
-        assert!(recognizer.input(KEY, 2, at(start, 100)).is_empty());
     }
 
-    #[test]
-    fn long_press_fires_at_deadline_and_release_does_not_double() {
-        let start = Instant::now();
-        let mut recognizer = GestureRecognizer::default();
-        recognizer.input(KEY, 1, start);
+    fn assert_long(events: &[KeyEvent], key: Key) {
         assert_eq!(
-            recognizer.advance(at(start, 500))[0].gesture,
-            KeyGesture::LongPress
+            events,
+            &[KeyEvent {
+                key,
+                gesture: KeyGesture::LongPress,
+            }]
         );
-        assert!(recognizer.input(KEY, 0, at(start, 600)).is_empty());
     }
 
-    #[test]
-    fn second_release_within_gap_emits_double_press() {
-        let start = Instant::now();
-        let mut recognizer = GestureRecognizer::default();
-        recognizer.input(KEY, 1, start);
-        recognizer.input(KEY, 0, at(start, 10));
-        recognizer.input(KEY, 1, at(start, 100));
+    fn assert_release(events: &[KeyEvent], key: Key) {
         assert_eq!(
-            recognizer.input(KEY, 0, at(start, 200))[0].gesture,
-            KeyGesture::DoublePress
+            events,
+            &[KeyEvent {
+                key,
+                gesture: KeyGesture::Release,
+            }]
         );
     }
 
+    // ---- Key mapping ---------------------------------------------------------
+
     #[test]
-    fn interactions_and_suspend_clear_state() {
-        let start = Instant::now();
-        let mut recognizer = GestureRecognizer::default();
-        recognizer.input(KEY, 1, start);
-        recognizer.clear();
-        assert!(recognizer.input(KEY, 0, at(start, 10)).is_empty());
-        recognizer.input(KEY, 1, at(start, 20));
-        assert!(recognizer.input(KEY, 0, at(start, 500)).is_empty());
+    fn letters_digits_and_familiar_punctuation_map_from_codes() {
+        assert_eq!(Key::from_code(30), Key::Letter('a'));
+        assert_eq!(Key::from_code(16), Key::Letter('q'));
+        assert_eq!(Key::from_code(44), Key::Letter('z'));
+        assert_eq!(Key::from_code(2), Key::Digit(1));
+        assert_eq!(Key::from_code(11), Key::Digit(0));
+        assert_eq!(Key::from_code(71), Key::Digit(7));
+        assert_eq!(Key::from_code(12), Key::Character('-'));
+        assert_eq!(Key::from_code(13), Key::Character('='));
+        assert_eq!(Key::from_code(41), Key::Character('`'));
+        assert_eq!(Key::from_code(43), Key::Character('\\'));
+        assert_eq!(Key::from_code(26), Key::Character('['));
+        assert_eq!(Key::from_code(27), Key::Character(']'));
     }
 
     #[test]
-    fn release_without_press_and_key_mismatch_do_not_leak_state() {
-        let start = Instant::now();
-        let mut recognizer = GestureRecognizer::default();
-        assert!(recognizer.input(KEY, 0, start).is_empty());
-        recognizer.input(KEY, 1, start);
-        assert!(recognizer.input(Key::Enter, 0, at(start, 10)).is_empty());
-        assert!(recognizer.advance(at(start, 1_000)).is_empty());
+    fn modifiers_functions_navigation_media_and_brightness_map_from_codes() {
+        assert_eq!(Key::from_code(29), Key::Ctrl);
+        assert_eq!(Key::from_code(97), Key::RCtrl);
+        assert_eq!(Key::from_code(42), Key::Shift);
+        assert_eq!(Key::from_code(54), Key::RShift);
+        assert_eq!(Key::from_code(56), Key::Alt);
+        assert_eq!(Key::from_code(100), Key::RAlt);
+        assert_eq!(Key::from_code(125), Key::Meta);
+        assert_eq!(Key::from_code(126), Key::RMeta);
+        assert_eq!(Key::from_code(58), Key::CapsLock);
+        assert_eq!(Key::from_code(59), Key::F(1));
+        assert_eq!(Key::from_code(68), Key::F(10));
+        assert_eq!(Key::from_code(103), Key::Up);
+        assert_eq!(Key::from_code(108), Key::Down);
+        assert_eq!(Key::from_code(105), Key::Left);
+        assert_eq!(Key::from_code(106), Key::Right);
+        assert_eq!(Key::from_code(113), Key::Mute);
+        assert_eq!(Key::from_code(114), Key::VolumeDown);
+        assert_eq!(Key::from_code(115), Key::VolumeUp);
+        assert_eq!(Key::from_code(224), Key::BrightnessDown);
+        assert_eq!(Key::from_code(225), Key::BrightnessUp);
+        assert_eq!(Key::from_code(163), Key::NextSong);
+        assert_eq!(Key::from_code(164), Key::PlayPause);
+        assert_eq!(Key::from_code(165), Key::PreviousSong);
+        assert_eq!(Key::from_code(58), Key::CapsLock);
     }
 
     #[test]
-    fn reader_failure_waits_before_reconnect_and_suspend_blocks_it() {
-        let start = Instant::now();
-        let state = ReaderState::new(start).disconnected(start);
-        assert!(!state.should_reconnect(at(start, 2_999)));
-        assert!(state.should_reconnect(at(start, 3_000)));
-        let suspended = ReaderState::Suspended;
-        assert!(!suspended.should_reconnect(at(start, 30_000)));
-        assert!(ReaderState::Waiting(at(start, 30_000)).should_reconnect(at(start, 30_000)));
+    fn unknown_codes_map_to_unknown_with_the_original_value() {
+        assert_eq!(Key::from_code(0xFFFF), Key::Unknown(0xFFFF));
+        assert_eq!(Key::from_code(0), Key::Unknown(0));
+    }
+
+    // ---- Recognizer ----------------------------------------------------------
+
+    #[test]
+    fn press_emits_press_immediately() {
+        let mut rec = GestureRecognizer::default();
+        let events = press(&mut rec, Key::Escape, base(), 0);
+        assert_press(&events, Key::Escape);
     }
 
     #[test]
-    fn discovered_devices_get_one_reader_each_and_new_devices_are_added() {
-        let start = Instant::now();
-        let first = PathBuf::from("/dev/input/event-a");
-        let second = PathBuf::from("/dev/input/event-b");
-        let third = PathBuf::from("/dev/input/event-c");
-        let mut devices = HashMap::new();
-        add_discovered(
-            &mut devices,
-            [first.clone(), second.clone(), first.clone()],
-            start,
-        );
-        assert_eq!(devices.len(), 2);
-        add_discovered(&mut devices, [second, third], at(start, 250));
-        assert_eq!(devices.len(), 3);
+    fn duplicate_down_is_ignored_without_resetting_the_clock() {
+        let start = base();
+        let mut rec = GestureRecognizer::default();
+        press(&mut rec, Key::Escape, start, 0);
+        assert!(press(&mut rec, Key::Escape, start, 400).is_empty());
+        assert!(rec.advance(at_ms(start, 499)).is_empty());
+        assert_long(&rec.advance(at_ms(start, 500)), Key::Escape);
     }
 
     #[test]
-    fn readers_merge_events_without_sharing_gesture_state() {
-        let subscribers = Arc::new(Mutex::new(Vec::new()));
-        let state = Arc::new(Mutex::new(SubscriptionState {
-            events: VecDeque::new(),
-            waker: None,
-            closed: false,
-        }));
-        subscribers.lock().unwrap().push(Arc::clone(&state));
-        let subscription = KeyboardSubscription { state };
-        publish(
-            &subscribers,
+    fn double_press_within_the_gap_emits_double_press_and_releases() {
+        let start = base();
+        let mut rec = GestureRecognizer::default();
+        press(&mut rec, Key::Escape, start, 0);
+        assert_release(&release(&mut rec, Key::Escape, start, 50), Key::Escape);
+        press(&mut rec, Key::Escape, start, 200);
+        let events = release(&mut rec, Key::Escape, start, 300);
+        // The physical key-up reports Release first, then the gesture: the
+        // second release inside the gap yields `Release → DoublePress`.
+        assert_eq!(
+            events,
             vec![
                 KeyEvent {
-                    key: Key::Space,
-                    gesture: KeyGesture::Press,
+                    key: Key::Escape,
+                    gesture: KeyGesture::Release,
                 },
                 KeyEvent {
-                    key: Key::Enter,
-                    gesture: KeyGesture::Press,
+                    key: Key::Escape,
+                    gesture: KeyGesture::DoublePress,
                 },
-            ],
+            ]
         );
-        assert_eq!(subscription.try_recv().unwrap().key, Key::Space);
-        assert_eq!(subscription.try_recv().unwrap().key, Key::Enter);
+    }
 
-        let start = Instant::now();
-        let mut keyboard_one = GestureRecognizer::default();
-        let mut keyboard_two = GestureRecognizer::default();
-        keyboard_one.input(Key::Space, 1, start);
-        keyboard_two.input(Key::Space, 1, at(start, 100));
+    #[test]
+    fn second_release_outside_the_gap_starts_a_fresh_sequence() {
+        let start = base();
+        let mut rec = GestureRecognizer::default();
+        press(&mut rec, Key::Escape, start, 0);
+        assert_release(&release(&mut rec, Key::Escape, start, 40), Key::Escape);
+        press(&mut rec, Key::Escape, start, 2000);
+        assert_release(&release(&mut rec, Key::Escape, start, 2100), Key::Escape);
+    }
+
+    #[test]
+    fn long_press_fires_once_at_the_deadline_and_release_is_reported() {
+        let start = base();
+        let mut rec = GestureRecognizer::default();
+        assert_press(&press(&mut rec, Key::Escape, start, 0), Key::Escape);
+        assert_long(&rec.advance(at_ms(start, 500)), Key::Escape);
+        assert_release(&release(&mut rec, Key::Escape, start, 600), Key::Escape);
+    }
+
+    #[test]
+    fn release_after_long_press_never_doubles() {
+        let start = base();
+        let mut rec = GestureRecognizer::default();
+        press(&mut rec, Key::Escape, start, 0);
+        rec.advance(at_ms(start, 500));
+        assert_release(&release(&mut rec, Key::Escape, start, 600), Key::Escape);
+        press(&mut rec, Key::Escape, start, 700);
+        assert_release(&release(&mut rec, Key::Escape, start, 800), Key::Escape);
+    }
+
+    #[test]
+    fn double_press_in_the_window_precedes_long_press() {
+        let start = base();
+        let mut rec = GestureRecognizer::default();
+        press(&mut rec, Key::Escape, start, 0);
+        assert_release(&release(&mut rec, Key::Escape, start, 20), Key::Escape);
+        press(&mut rec, Key::Escape, start, 300);
+        let events = release(&mut rec, Key::Escape, start, 350);
         assert_eq!(
-            keyboard_one.advance(at(start, 500))[0].gesture,
-            KeyGesture::LongPress
+            events,
+            vec![
+                KeyEvent {
+                    key: Key::Escape,
+                    gesture: KeyGesture::Release,
+                },
+                KeyEvent {
+                    key: Key::Escape,
+                    gesture: KeyGesture::DoublePress,
+                },
+            ]
         );
-        assert!(keyboard_two.advance(at(start, 500)).is_empty());
+        // Wait past long-press deadline: no LongPress should double-emit here.
+        assert!(rec.advance(at_ms(start, 900)).is_empty());
+    }
+
+    #[test]
+    fn overlapping_holds_are_recognized_independently() {
+        let start = base();
+        let mut rec = GestureRecognizer::default();
+        press(&mut rec, Key::Escape, start, 0);
+        press(&mut rec, Key::Tab, start, 20);
+        let events = rec.advance(at_ms(start, 700));
+        assert_eq!(
+            events,
+            vec![
+                KeyEvent {
+                    key: Key::Escape,
+                    gesture: KeyGesture::LongPress,
+                },
+                KeyEvent {
+                    key: Key::Tab,
+                    gesture: KeyGesture::LongPress,
+                },
+            ]
+        );
+        // Each key keeps its own LongPress/Release state: releasing one never
+        // affects the other, and each hold gets exactly one Release.
+        assert_release(&release(&mut rec, Key::Escape, start, 800), Key::Escape);
+        assert_release(&release(&mut rec, Key::Tab, start, 900), Key::Tab);
+        assert!(rec.advance(at_ms(start, 1000)).is_empty());
+    }
+
+    #[test]
+    fn short_press_emits_press_then_release_without_long_press() {
+        let start = base();
+        let mut rec = GestureRecognizer::default();
+        assert_press(&press(&mut rec, Key::Escape, start, 0), Key::Escape);
+        assert_release(&release(&mut rec, Key::Escape, start, 50), Key::Escape);
+        // Nothing was held past the threshold, so no LongPress can appear.
+        assert!(rec.advance(at_ms(start, 900)).is_empty());
+    }
+
+    #[test]
+    fn long_press_emits_press_longpress_then_release() {
+        let start = base();
+        let mut rec = GestureRecognizer::default();
+        assert_press(&press(&mut rec, Key::Escape, start, 0), Key::Escape);
+        assert_long(&rec.advance(at_ms(start, 500)), Key::Escape);
+        assert_release(&release(&mut rec, Key::Escape, start, 600), Key::Escape);
+    }
+
+    #[test]
+    fn long_press_fires_only_once_during_a_single_hold() {
+        let start = base();
+        let mut rec = GestureRecognizer::default();
+        press(&mut rec, Key::Escape, start, 0);
+        assert_long(&rec.advance(at_ms(start, 500)), Key::Escape);
+        // The key is still physically held; further ticks must not re-fire
+        // LongPress.
+        assert!(rec.advance(at_ms(start, 700)).is_empty());
+        assert!(rec.advance(at_ms(start, 900)).is_empty());
+        assert_release(&release(&mut rec, Key::Escape, start, 1000), Key::Escape);
+    }
+
+    #[test]
+    fn release_before_threshold_never_produces_long_press() {
+        let start = base();
+        let mut rec = GestureRecognizer::default();
+        assert_press(&press(&mut rec, Key::Escape, start, 0), Key::Escape);
+        assert_release(&release(&mut rec, Key::Escape, start, 499), Key::Escape);
+        assert!(rec.advance(at_ms(start, 900)).is_empty());
+    }
+
+    #[test]
+    fn repeated_key_down_does_not_duplicate_long_press_or_held_state() {
+        let start = base();
+        let mut rec = GestureRecognizer::default();
+        assert_press(&press(&mut rec, Key::Escape, start, 0), Key::Escape);
+        // Kernel auto-repeat / spurious re-downs for the still-held key are
+        // ignored and cannot reset the long-press clock.
+        assert!(press(&mut rec, Key::Escape, start, 100).is_empty());
+        assert!(press(&mut rec, Key::Escape, start, 480).is_empty());
+        assert_long(&rec.advance(at_ms(start, 500)), Key::Escape);
+        assert!(press(&mut rec, Key::Escape, start, 550).is_empty());
+        // Still one hold, exactly one LongPress, one Release on key-up.
+        assert!(rec.advance(at_ms(start, 900)).is_empty());
+        assert_release(&release(&mut rec, Key::Escape, start, 1000), Key::Escape);
+    }
+
+    #[test]
+    fn clear_resets_held_state() {
+        let start = base();
+        let mut rec = GestureRecognizer::default();
+        press(&mut rec, Key::Escape, start, 0);
+        rec.clear();
+        assert!(rec.advance(at_ms(start, 900)).is_empty());
+    }
+
+    // ---- ReaderState ---------------------------------------------------------
+
+    #[test]
+    fn reader_state_gates_reconnection_on_its_disconnect_deadline() {
+        let start = base();
+        let ready = ReaderState::new(start);
+        assert!(ready.should_reconnect(start));
+        let disconnected = ready.disconnected(start);
+        assert!(!disconnected.should_reconnect(at_ms(start, 2500)));
+        assert!(disconnected.should_reconnect(at_ms(start, 3500)));
+    }
+
+    // ---- Uevent parsing ------------------------------------------------------
+
+    // Real NETLINK_KOBJECT_UEVENT datagrams carry no netlink header: the
+    // payload begins directly with the kernel uevent prefix word
+    // (`add@/devices/...`, NUL-terminated), followed by NUL-separated
+    // `KEY=VALUE` env fields. Tests emit exactly that wire layout.
+    fn uevent_buffer(payload: &[&[u8]]) -> Vec<u8> {
+        let mut buffer: Vec<u8> = Vec::new();
+        for field in payload {
+            buffer.extend_from_slice(field);
+            buffer.push(0);
+        }
+        buffer
+    }
+
+    #[test]
+    fn parses_add_uevent_with_action_and_authoritative_devpath() {
+        let buffer = uevent_buffer(&[
+            b"add@/devices/pci0000:00/0000:00:14.0/usb1/1-2/1-2:1.0/input/input11/event11",
+            b"ACTION=add",
+            b"DEVPATH=/devices/pci0000:00/0000:00:14.0/usb1/1-2/1-2:1.0/input/input11/event11",
+            b"SUBSYSTEM=input",
+        ]);
+        let event = parse_uevent(&buffer).expect("parseable");
+        assert_eq!(event.action, "add");
+        assert_eq!(event.subsystem.as_deref(), Some("input"));
+        assert_eq!(
+            event.devpath.as_deref(),
+            Some("/devices/pci0000:00/0000:00:14.0/usb1/1-2/1-2:1.0/input/input11/event11")
+        );
+    }
+
+    #[test]
+    fn parses_remove_uevent_with_action_and_authoritative_devpath() {
+        let buffer = uevent_buffer(&[
+            b"remove@/devices/pci0000:00/0000:00:14.0/usb1/1-2/1-2:1.0/input/input11/event11",
+            b"ACTION=remove",
+            b"DEVPATH=/devices/pci0000:00/0000:00:14.0/usb1/1-2/1-2:1.0/input/input11/event11",
+            b"SUBSYSTEM=input",
+        ]);
+        let event = parse_uevent(&buffer).expect("parseable");
+        assert_eq!(event.action, "remove");
+        assert_eq!(event.subsystem.as_deref(), Some("input"));
+        assert_eq!(
+            event.devpath.as_deref(),
+            Some("/devices/pci0000:00/0000:00:14.0/usb1/1-2/1-2:1.0/input/input11/event11")
+        );
+    }
+
+    #[test]
+    fn parses_change_uevent_with_action_and_authoritative_devpath() {
+        let buffer = uevent_buffer(&[
+            b"change@/devices/pci0000:00/0000:00:14.0/usb1/1-2/1-2:1.0/input/input11/event11",
+            b"ACTION=change",
+            b"DEVPATH=/devices/pci0000:00/0000:00:14.0/usb1/1-2/1-2:1.0/input/input11/event11",
+            b"SUBSYSTEM=input",
+        ]);
+        let event = parse_uevent(&buffer).expect("parseable");
+        assert_eq!(event.action, "change");
+        assert_eq!(
+            event.devpath.as_deref(),
+            Some("/devices/pci0000:00/0000:00:14.0/usb1/1-2/1-2:1.0/input/input11/event11")
+        );
+    }
+
+    #[test]
+    fn tolerates_extra_arbitrary_key_value_fields() {
+        let buffer = uevent_buffer(&[
+            b"add@/devices/pci0000:00/0000:00:14.0/usb1/1-2/1-2:1.0/input/input11/event11",
+            b"ACTION=add",
+            b"DEVPATH=/devices/pci0000:00/0000:00:14.0/usb1/1-2/1-2:1.0/input/input11/event11",
+            b"SUBSYSTEM=input",
+            b"SEQNUM=4811",
+            b"MAJOR=13",
+            b"MINOR=71",
+            b"DEVNAME=input/event11",
+            b"SOME_VENDOR_EXTENSION=foo=bar",
+        ]);
+        let event = parse_uevent(&buffer).expect("parseable");
+        assert_eq!(event.action, "add");
+        assert_eq!(event.subsystem.as_deref(), Some("input"));
+        assert_eq!(
+            event.devpath.as_deref(),
+            Some("/devices/pci0000:00/0000:00:14.0/usb1/1-2/1-2:1.0/input/input11/event11")
+        );
+    }
+
+    #[test]
+    fn devpath_field_is_authoritative_over_prefix_word() {
+        let buffer = uevent_buffer(&[
+            b"remove@/devices/decoy/prefix/only",
+            b"ACTION=remove",
+            b"DEVPATH=/devices/pci0000:00/0000:00:14.0/usb1/1-2/1-2:1.0/input/input11/event11",
+            b"SUBSYSTEM=input",
+        ]);
+        let event = parse_uevent(&buffer).expect("parseable");
+        assert_eq!(event.action, "remove");
+        // The authoritative device path comes from DEVPATH=, never by
+        // reconstructing the `remove@...` prefix word.
+        assert_eq!(
+            event.devpath.as_deref(),
+            Some("/devices/pci0000:00/0000:00:14.0/usb1/1-2/1-2:1.0/input/input11/event11")
+        );
+        assert_ne!(event.devpath.as_deref(), Some("/devices/decoy/prefix/only"));
+    }
+
+    #[test]
+    fn action_field_is_authoritative_over_prefix_word() {
+        let buffer = uevent_buffer(&[
+            b"add@/devices/pci0000:00/0000:00:14.0/usb1/1-2/1-2:1.0/input/input11/event11",
+            b"ACTION=remove",
+            b"DEVPATH=/devices/pci0000:00/0000:00:14.0/usb1/1-2/1-2:1.0/input/input11/event11",
+            b"SUBSYSTEM=input",
+        ]);
+        let event = parse_uevent(&buffer).expect("parseable");
+        assert_eq!(event.action, "remove");
+    }
+
+    #[test]
+    fn empty_buffer_has_no_uevent() {
+        assert!(parse_uevent(&[]).is_none());
+        assert!(parse_uevent(b"not-a-uevent").is_none());
+    }
+
+    // A remove uevent is honored only when it carries the authoritative
+    // `DEVPATH=` field. The device is identified by DEVPATH exactly: a device
+    // matching DEVPATH is removed even when the `remove@...` prefix word and
+    // `DEVNAME=` point at a different event device.
+    #[test]
+    fn remove_uevent_uses_devpath_and_never_prefix_or_devname() {
+        let present = Arc::new(AtomicBool::new(true));
+        let probe = Arc::clone(&present);
+        let mut state = WorkerState::new(move || {
+            if probe.load(Ordering::Relaxed) {
+                vec![
+                    Pb::from("/dev/input/event11"),
+                    Pb::from("/dev/input/event99"),
+                ]
+            } else {
+                Vec::new()
+            }
+        });
+        let now = base();
+        state.rescan(now);
+        assert!(state.devices.contains_key(&Pb::from("/dev/input/event11")));
+        assert!(state.devices.contains_key(&Pb::from("/dev/input/event99")));
+
+        // The kernel has dropped the device from udev, so the reconciliation
+        // rescan no longer reports it; only the remove handling matters now.
+        present.store(false, Ordering::Relaxed);
+
+        let event = parse_uevent(&uevent_buffer(&[
+            b"remove@/devices/pci0000:00/0000:00:14.0/usb1/1-2/1-2:1.0/input/input99/event99",
+            b"ACTION=remove",
+            b"DEVPATH=/devices/pci0000:00/0000:00:14.0/usb1/1-2/1-2:1.0/input/input11/event11",
+            b"SUBSYSTEM=input",
+            b"DEVNAME=input/event99",
+        ]))
+        .expect("parseable");
+        assert_eq!(event.action, "remove");
+
+        state.handle_uevent(&event, now);
+
+        // The device identified by DEVPATH= is removed; the decoy
+        // `remove@.../event99` prefix word and `DEVNAME=input/event99` are
+        // never used to reconstruct a removal path.
+        assert!(!state.devices.contains_key(&Pb::from("/dev/input/event11")));
+        assert!(state.devices.contains_key(&Pb::from("/dev/input/event99")));
+    }
+
+    // A remove uevent without DEVPATH= is incomplete/invalid: it is safely
+    // ignored, and no device is removed even when the `remove@...` prefix word
+    // and `DEVNAME=` look like valid event devices.
+    #[test]
+    fn remove_uevent_without_devpath_is_safely_ignored() {
+        let present = Arc::new(AtomicBool::new(true));
+        let probe = Arc::clone(&present);
+        let mut state = WorkerState::new(move || {
+            if probe.load(Ordering::Relaxed) {
+                vec![Pb::from("/dev/input/event11")]
+            } else {
+                Vec::new()
+            }
+        });
+        let now = base();
+        state.rescan(now);
+        assert!(state.devices.contains_key(&Pb::from("/dev/input/event11")));
+
+        present.store(false, Ordering::Relaxed);
+
+        let event = parse_uevent(&uevent_buffer(&[
+            b"remove@/devices/pci0000:00/0000:00:14.0/usb1/1-2/1-2:1.0/input/input11/event11",
+            b"ACTION=remove",
+            b"SUBSYSTEM=input",
+            b"DEVNAME=input/event11",
+        ]))
+        .expect("parseable");
+        assert_eq!(event.action, "remove");
+        assert!(event.devpath.is_none());
+
+        state.handle_uevent(&event, now);
+
+        // No device path is reconstructed from the `remove@...` prefix word or
+        // from DEVNAME=: the device stays.
+        assert!(state.devices.contains_key(&Pb::from("/dev/input/event11")));
     }
 }

@@ -10,8 +10,9 @@ use std::io;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::task::{RawWaker, RawWakerVTable, Waker};
 
-/// How long the DRM loop waits while the document is animating (≈60 Hz). Once
-/// animation stops, [`WakeFd::wait`] blocks indefinitely again.
+/// Fallback animation cadence (≈60 Hz) used when the display mode reports no
+/// vertical refresh rate. Otherwise the loop paces to the mode's own refresh
+/// interval. Once animation stops, [`WakeFd::wait`] blocks indefinitely again.
 pub(crate) const ANIM_TICK: std::time::Duration = std::time::Duration::from_millis(16);
 
 /// An `eventfd` host wake and runtime waker.

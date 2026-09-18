@@ -6,8 +6,8 @@
 //! connector with `DRM_IOCTL_MODE_SETCRTC`.
 //!
 //! This is deliberately the smallest modeset that can put a framebuffer on the
-//! panel. There is no page flipping, no double buffering, no DirtyFB, no
-//! atomic modesetting, and no scanning/refresh loop.
+//! panel. It performs no damage reporting itself: that belongs to the
+//! presentation loop in [`crate::DrmBackend`].
 
 use std::error::Error;
 
