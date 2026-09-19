@@ -1,0 +1,361 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="description" content="Touchbard — a modern, open-source Touch Bar UI runtime for Linux, in Rust. USB prep, DRM/KMS modeset, Vello CPU rendering, evdev input.">
+<title>Touchbard — Touch Bar application for Linux</title>
+<link rel="icon" href="./logo.png">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<style>
+  :root {
+    --bg:  #0e1119; --panel: #151926; --panelx: #0d1018;
+    --line: #262c42; --line-s: #1d2336;
+    --text: #eef2fa; --muted: #8b94b4; --dim: #626c8c;
+    --accent: #3c89f6; --accent-2: #7759f6; --accent-3: #2fd6f6;
+    --grad: linear-gradient(135deg, #3c89f6, #7759f6);
+    --mono: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    --sans: "Inter", ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  html { scroll-behavior: smooth; }
+  body { font-family: var(--sans); background: var(--bg); color: var(--text); line-height: 1.6; -webkit-font-smoothing: antialiased; }
+  a { color: var(--accent); text-decoration: none; }
+  .wrap { max-width: 940px; margin: 0 auto; padding: 0 24px; }
+  code, pre { font-family: var(--mono); }
+
+  /* nav */
+  nav { position: sticky; top: 0; z-index: 20; background: rgba(14,17,25,.85); backdrop-filter: blur(12px); border-bottom: 1px solid var(--line-s); }
+  nav .wrap { display: flex; align-items: center; gap: 24px; padding: 12px 24px; }
+  .brand { display: flex; align-items: center; gap: 12px; font-weight: 800; letter-spacing: .12em; text-transform: uppercase; font-size: 14px; color: var(--text); }
+  .brand img { width: 42px; height: auto; }
+  .brand em { font-style: normal; background: var(--grad); -webkit-background-clip: text; background-clip: text; color: transparent; }
+  nav .links { margin-left: auto; display: flex; align-items: center; gap: 22px; }
+  nav .links a { color: var(--muted); font-size: 13.5px; }
+  nav .links a:hover { color: var(--text); }
+  .btn { display: inline-flex; align-items: center; gap: 8px; padding: 10px 20px; border-radius: 10px; font-weight: 600; font-size: 14px; color: #fff; background: var(--grad); box-shadow: 0 10px 28px -14px rgba(119,89,246,.85); }
+  .btn:hover { filter: brightness(1.1); }
+  .btn-sm { padding: 8px 16px; font-size: 13px; border-radius: 9px; }
+
+  /* hero */
+  .hero { padding: 100px 0 70px; text-align: center; }
+  .hero-logo { width: min(26vw, 156px); margin: 0 auto 24px; opacity: .95; display: block; }
+  .eyebrow { display: inline-flex; align-items: center; gap: 8px; font-size: 11.5px; font-weight: 700; letter-spacing: .2em; text-transform: uppercase; color: var(--accent); margin-bottom: 20px; }
+  .eyebrow::before, .eyebrow::after { content: ""; width: 22px; height: 1px; background: var(--accent); opacity: .5; }
+  .hero h1 { font-size: clamp(2.2rem, 6.5vw, 3.6rem); font-weight: 800; letter-spacing: -.03em; line-height: 1.07; margin-bottom: 18px; }
+  .grad-text { background: var(--grad); -webkit-background-clip: text; background-clip: text; color: transparent; }
+  .hero p { max-width: 600px; margin: 0 auto; color: var(--muted); font-size: 16px; }
+  .hero .cta { display: flex; gap: 12px; justify-content: center; flex-wrap: wrap; margin-top: 30px; }
+  .install-cmd { margin: 28px auto 0; width: min(100%, 640px); display: flex; align-items: center; gap: 12px; background: var(--panelx); border: 1px solid var(--line); border-radius: 12px; padding: 12px 14px; max-width: 640px; margin-inline: auto; }
+  .prompt { color: var(--accent); font-weight: 600; flex: none; }
+  .install-cmd code { font-size: 13px; color: var(--text); flex: 1; min-width: 0; text-align: left; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .install-cmd code .hl { color: var(--accent); }
+  .copy { flex: none; width: 32px; height: 32px; border-radius: 8px; cursor: pointer; border: 1px solid var(--line); background: rgba(255,255,255,.04); color: var(--muted); font-size: 14px; }
+  .copy:hover { color: var(--text); border-color: var(--accent); }
+  .copy.copied { color: #0e1119; background: var(--accent); }
+
+  /* sections */
+  section { padding: 70px 0; border-top: 1px solid var(--line-s); }
+  .kicker { font-size: 11.5px; font-weight: 700; letter-spacing: .3em; text-transform: uppercase; color: var(--accent); margin-bottom: 10px; }
+  .head { margin-bottom: 34px; }
+  .head h2 { font-size: clamp(1.5rem, 3.6vw, 2.1rem); font-weight: 800; letter-spacing: -.02em; margin-bottom: 12px; }
+  .head p { color: var(--muted); max-width: 680px; }
+
+  .cards { display: grid; grid-template-columns: repeat(3, 1fr); gap: 14px; }
+  @media (max-width: 760px) { .cards, .two { grid-template-columns: 1fr !important; } }
+  .card { border: 1px solid var(--line); border-radius: 14px; padding: 22px; background: var(--panel); }
+  .card h3 { font-size: 15.5px; margin-bottom: 8px; }
+  .card h3 .mono { font-size: 13px; color: var(--accent-3); }
+  .card p { color: var(--muted); font-size: 13.5px; }
+  .card:hover { border-color: var(--accent); }
+  .two { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; }
+
+  .win { border-radius: 14px; overflow: hidden; border: 1px solid var(--line); background: var(--panelx); }
+  .win-bar { display: flex; align-items: center; gap: 7px; padding: 11px 16px; background: rgba(255,255,255,.03); border-bottom: 1px solid var(--line-s); }
+  .win-bar .dot { width: 11px; height: 11px; border-radius: 50%; }
+  .win-bar .r { background: #ff5f57; } .win-bar .y { background: #febc2e; } .win-bar .g { background: #28c840; }
+  .win-bar .tag { margin-left: auto; font-family: var(--mono); font-size: 11px; color: var(--muted); }
+  .win-body { padding: 18px 20px; overflow-x: auto; }
+  pre { font-size: 13px; line-height: 1.75; }
+  .c { color: #5a6586; font-style: italic; } .t { color: #7bd0ff; } .f { color: #8cf0a4; } .s { color: #ffd97a; } .k { color: #ff8fb3; } .dim { color: var(--dim); } .n { color: #eef2fa; }
+
+  /* steps */
+  .steps { counter-reset: s; display: grid; gap: 12px; }
+  .step { display: flex; gap: 16px; align-items: flex-start; border: 1px solid var(--line); border-radius: 14px; padding: 18px 20px; background: var(--panel); }
+  .step::before { counter-increment: s; content: counter(s, decimal-leading-zero); font-family: var(--mono); font-weight: 600; font-size: 15px; color: var(--accent); border: 1px solid var(--line); border-radius: 8px; width: 34px; height: 34px; display: grid; place-items: center; flex: none; background: rgba(60,137,246,.08); }
+  .step h4 { font-size: 15px; margin-bottom: 4px; }
+  .step p { color: var(--muted); font-size: 13.5px; }
+  .step code, .step b code { color: var(--text); background: rgba(60,137,246,.1); padding: 1px 6px; border-radius: 5px; font-size: 12px; }
+  .step .sub { color: var(--dim); font-size: 12.5px; font-family: var(--mono); }
+
+  table { width: 100%; border-collapse: collapse; font-size: 13.5px; }
+  th, td { text-align: left; padding: 10px 12px; border-bottom: 1px solid var(--line); vertical-align: top; }
+  th { color: var(--accent); font-size: 11px; letter-spacing: .13em; text-transform: uppercase; }
+  td code { color: var(--text); background: rgba(60,137,246,.1); padding: 2px 7px; border-radius: 5px; font-size: 12px; }
+  td { color: var(--muted); }
+  td b { color: var(--text); font-weight: 600; }
+
+  .pipe { display: flex; align-items: center; justify-content: center; gap: 10px; flex-wrap: wrap; font-family: var(--mono); font-size: 13px; color: var(--muted); }
+  .pipe b { font-weight: 600; color: var(--text); }
+  .pipe .a { color: var(--accent); }
+
+  .note { background: rgba(47,214,246,.06); border: 1px solid rgba(47,214,246,.25); border-radius: 12px; padding: 14px 18px; font-size: 13.5px; color: var(--muted); }
+  .note b { color: var(--text); }
+  ul.ticks { list-style: none; display: grid; gap: 10px; }
+  ul.ticks li { color: var(--muted); font-size: 14px; padding-left: 26px; position: relative; }
+  ul.ticks li::before { content: "✓"; position: absolute; left: 0; top: 0; color: var(--accent-3); font-family: var(--mono); }
+  ul.ticks li code { color: var(--text); background: rgba(60,137,246,.1); padding: 1px 6px; border-radius: 5px; font-size: 12px; }
+
+  .cta-panel { text-align: center; border: 1px solid var(--line); border-radius: 18px; padding: 56px 30px; background: linear-gradient(180deg, rgba(119,89,246,.12), rgba(60,137,246,.04)); }
+  .cta-panel h2 { font-size: clamp(1.6rem, 4vw, 2.4rem); font-weight: 800; letter-spacing: -.02em; margin-bottom: 12px; }
+  .cta-panel p { color: var(--muted); max-width: 540px; margin: 0 auto 28px; }
+
+  footer { border-top: 1px solid var(--line-s); padding: 28px 0 38px; text-align: center; color: var(--dim); font-size: 13px; }
+  footer .motto { font-weight: 700; letter-spacing: .14em; text-transform: uppercase; background: var(--grad); -webkit-background-clip: text; background-clip: text; color: transparent; margin-bottom: 6px; }
+
+  @media (max-width: 560px) {
+    .hero { padding: 76px 0 56px; }
+    nav .links a.gh { display: none; }
+    .install-cmd code { white-space: normal; word-break: break-all; }
+  }
+</style>
+</head>
+<body>
+
+<nav>
+  <div class="wrap">
+    <a class="brand" href="#top"><img src="./logo.png" alt=""><span>touch<em>bard</em></span></a>
+    <div class="links">
+      <a href="#why">Why</a>
+      <a href="#how">How it works</a>
+      <a href="#pipeline">Pipeline</a>
+      <a href="#architecture">Architecture</a>
+      <a href="#apps">Rendering apps</a>
+      <a class="gh" href="https://github.com/dev-muhammad-adel/touchbard" target="_blank" rel="noopener">GitHub</a>
+    </div>
+  </div>
+</nav>
+
+<header class="hero" id="top">
+  <div class="wrap">
+    <img class="hero-logo" src="./logo.png" alt="touchbard logo">
+    <div class="eyebrow">Fast · Safe · Open Source · In Rust</div>
+    <h1>Bring modern UI to<br>your <span class="grad-text">Touch Bar on Linux</span></h1>
+    <p>A single-window UI runtime for the Apple Touch Bar hyper-strip: USB preparation, DRM/KMS modeset, CPU rendering and pointer input — all in memory-safe Rust.</p>
+    <div class="cta">
+      <a class="btn" href="https://dev-muhammad-adel.github.io/touchbard/install.sh">Install</a>
+      <a class="btn" href="#how" style="background:transparent;color:var(--text);box-shadow:none;border:1px solid var(--line)">See how it works</a>
+    </div>
+    <div class="install-cmd">
+      <span class="prompt">$</span>
+      <code><span class="dim">curl -fsSL</span> https://<span class="hl">dev-muhammad-adel</span>.github.io/touchbard/install.sh <span class="dim">|</span> bash</code>
+      <button id="copy-install" class="copy" title="Copy" aria-label="Copy">⧉</button>
+    </div>
+    <div class="pipe" style="margin-top:34px">
+      <span>USB prep</span><span class="a">→</span><span>DRM/KMS</span><span class="a">→</span><span>UI render</span><span class="a">→</span><span><b>Touch Bar</b></span>
+    </div>
+  </div>
+</header>
+
+<section id="why">
+  <div class="wrap">
+    <div class="kicker">Why Touchbard</div>
+    <div class="head">
+      <h2>What the app gets from the runtime</h2>
+      <p>Write a normal reactive UI. Touchbard handles getting it onto the physical strip — hardware, display and input included.</p>
+    </div>
+    <div class="cards">
+      <div class="card"><h3>Real DRM/KMS</h3><p>No framebuffer tricks. Discovery → resources → modeset → CPU scanout straight to the Touch Bar panel.</p></div>
+      <div class="card"><h3>Keyboard &amp; touch input</h3><p><code class="mono">evdev</code> readers with gesture recognition, udev hotplug and suspend/resume — multiple devices supported.</p></div>
+      <div class="card"><h3>Memory-safe</h3><p>Rust end to end. The DRM backend fails cleanly at initialize and never fabricates a display.</p></div>
+      <div class="card"><h3>CPU only</h3><p>Vello rasterizes to a premultiplied RGBA8 framebuffer — no GPU required on the machine.</p></div>
+      <div class="card"><h3>60&nbsp;Hz, event-driven</h3><p>Frames are produced only when the document changes or animates; the loop idles the rest of the time.</p></div>
+      <div class="card"><h3>Open source</h3><p>A small set of workspace crates, built with cargo, auditable by anyone.</p></div>
+    </div>
+  </div>
+</section>
+
+<section id="how">
+  <div class="wrap">
+    <div class="kicker">How it works</div>
+    <div class="head">
+      <h2>From USB to backlight, five steps</h2>
+      <p>The pipeline the physical backends run at startup, in order.</p>
+    </div>
+    <div class="steps">
+      <div class="step">
+        <div>
+          <h4>USB preparation</h4>
+          <p>The Touch Bar lives behind an Apple USB interface. Touchbard switches it into its display configuration so the kernel DRM driver binds to the panel.</p>
+          <span class="sub">vendor 0x05ac · product 0x8302 · USB config 2</span>
+        </div>
+      </div>
+      <div class="step">
+        <div>
+          <h4>Connector discovery</h4>
+          <p>Find the DRM connector for the Touch Bar and read the authoritative physical dimensions from the device — 2008×60 landscape.</p>
+          <span class="sub">/dev/dri/cardN · sysfs</span>
+        </div>
+      </div>
+      <div class="step">
+        <div>
+          <h4>KMS resources &amp; modeset</h4>
+          <p>Allocate a transposed framebuffer (60×2008), set the mode, and let the driver attach it with a RIGHT_UP panel orientation.</p>
+          <span class="sub">drm_connector_set_panel_orientation(RIGHT_UP)</span>
+        </div>
+      </div>
+      <div class="step">
+        <div>
+          <h4>Render</h4>
+          <p>Dioxus → Blitz → AnyRender → Vello CPU produces a landscape frame, which is mapped into the transposed buffer as it scans out.</p>
+          <span class="sub">dst(fx, fy) = src(fy, H − 1 − fx)</span>
+        </div>
+      </div>
+      <div class="step">
+        <div>
+          <h4>Present &amp; wait</h4>
+          <p>Present only when a new frame exists. Wake once per eventfd, suspend/resume via logind, and bound to 60&nbsp;Hz while the UI animates.</p>
+          <span class="sub">eventfd wake · logind lifecycle</span>
+        </div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<section id="pipeline">
+  <div class="wrap">
+    <div class="kicker">Render pipeline</div>
+    <div class="head">
+      <h2>One pipeline, shared by every display</h2>
+      <p>The runtime renders into a premultiplied RGBA8 framebuffer; backends only consume frames.</p>
+    </div>
+    <div class="win">
+      <div class="win-bar"><span class="dot r"></span><span class="dot y"></span><span class="dot g"></span><span class="tag">touchbard::run</span></div>
+      <div class="win-body"><pre><code><span class="t">use</span> touchbard::<span class="f">{Backend, TouchbardConfig}</span>;
+<span class="t">use</span> touchbard_drm::<span class="t">DrmBackend</span>;
+<span class="t">use</span> touchbard_renderer::<span class="t">FrameSource</span>;
+
+<span class="c">// 1. initialize → authoritative Viewport, or fail cleanly</span>
+<span class="t">let</span> backend = DrmBackend::new(DrmConfig::default());
+<span class="t">let</span> viewport = backend.initialize()?;   <span class="c">// 2008×60 landscape</span>
+
+<span class="c">// 2. runtime builds the UI system at exactly that viewport</span>
+<span class="t">let</span> system = touchbard::system::System::<span class="k">new</span>(viewport);
+<span class="c">// 3. backend presents frames + feeds pointer/key events back</span>
+backend.<span class="k">run</span>(system)?;</code></pre></div>
+    </div>
+    <div class="pipe" style="margin-top:26px">
+      <span>Dioxus</span><span class="a">→</span><span>Blitz DOM/layout/style</span><span class="a">→</span><span>AnyRender</span><span class="a">→</span><span>Vello CPU</span><span class="a">→</span><span><b>Frame RGBA8</b></span><span class="a">→</span><span>DRM scanout</span>
+    </div>
+  </div>
+</section>
+
+<section id="architecture">
+  <div class="wrap">
+    <div class="kicker">Architecture</div>
+    <div class="head">
+      <h2>Small crates, one shared boundary</h2>
+      <p>The core runtime never knows which display it drives.</p>
+    </div>
+    <div class="two">
+      <div class="win">
+        <div class="win-bar"><span class="tag">workspace</span></div>
+        <div class="win-body"><div style="font-family:var(--mono);font-size:13px;line-height:2"><b>control-center</b> <span class="dim">· the app (example)</span><br>
+&nbsp;&nbsp;└→ <b>touchbard</b> <span class="dim">· runtime, routing, input</span><br>
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;└→ <b>touchbard-renderer</b> <span class="dim">· Frame · traits · CPU render</span><br>
+&nbsp;&nbsp;├→ <b>touchbard-drm</b> <span class="dim">· display, USB, input backend</span><br>
+&nbsp;&nbsp;└→ <b>touchbard-keyboard</b> <span class="dim">· evdev · gestures · udev</span></div></div>
+      </div>
+      <div class="win">
+        <div class="win-bar"><span class="tag">boundary traits</span></div>
+        <div class="win-body"><div style="font-family:var(--mono);font-size:13px;line-height:2"><span class="t">FrameSource</span> <span class="dim">· what the runtime implements</span><br>
+&nbsp;&nbsp;<span class="dim">handle_pointer_event · frame · needs_redraw</span><br>
+<span class="t">Backend</span> <span class="dim">· what each display implements</span><br>
+&nbsp;&nbsp;<span class="dim">initialize → Viewport · run(FrameSource)</span></div></div>
+      </div>
+    </div>
+    <div class="win" style="margin-top:14px">
+      <div class="win-bar"><span class="tag">input &amp; lifecycle</span></div>
+      <div class="win-body">
+        <table>
+          <tr><th>Area</th><th>What it covers</th></tr>
+          <tr><td><b>Keyboard input</b></td><td>Per-device <code>evdev</code> readers, key gestures, overlapping holds, udev hotplug, suspend/resume with state clearing.</td></tr>
+          <tr><td><b>Pointer events</b></td><td>Logical/CSS-pixel coordinates delivered into the same document the frame came from.</td></tr>
+          <tr><td><b>Suspend / resume</b></td><td>logind integration releases devices on suspend and re-reads them on resume via eventfd wake.</td></tr>
+          <tr><td><b>Frame pixel format</b></td><td>Premultiplied RGBA8 canonical; the transpose into the panel orientation handled at the DRM boundary.</td></tr>
+        </table>
+      </div>
+    </div>
+  </div>
+</section>
+
+<section id="apps">
+  <div class="wrap">
+    <div class="kicker">Rendering apps</div>
+    <div class="head">
+      <h2>Your folder is your route table</h2>
+      <p>The Control Center example is a file-based app — routes are wired at compile time by <code>app_router!()</code>, no registry.</p>
+    </div>
+    <div class="two">
+      <div class="win">
+        <div class="win-bar"><span class="tag">app/</span></div>
+        <div class="win-body"><div style="font-family:var(--mono);font-size:13px;line-height:1.9;white-space:pre"><b>app/</b>
+├── layout.rs             <span class="dim"># root layout</span>
+├── page.rs               <span class="dim"># index route</span>
+├── settings/<span class="t">[section]</span>/page.rs
+├── docs/<span class="t">[...chapter]</span>/page.rs
+├── (admin)/dashboard.rs
+├── not_found.rs          <span class="dim"># 404</span>
+└── error.rs              <span class="dim"># error boundary</span></div></div>
+      </div>
+      <div class="win">
+        <div class="win-bar"><span class="tag">hooks</span></div>
+        <div class="win-body">
+          <ul class="ticks">
+            <li><code>use_navigate()</code> — push a route</li>
+            <li><code>use_route()</code> — current path</li>
+            <li><code>use_route_param(n)</code> — dynamic segment</li>
+            <li>Nested <code>layout.rs</code>, route groups, catch-alls</li>
+            <li>Root <code>not_found.rs</code> / <code>error.rs</code> fallbacks</li>
+          </ul>
+        </div>
+      </div>
+    </div>
+    <div class="note" style="margin-top:18px"><b>Development mirror.</b> For desktop iteration a preview backend pipes the same frames to a browser over WebSocket — byte-identical pixels, no hardware attached. The DRM backend remains the production path.</div>
+  </div>
+</section>
+
+<section id="install">
+  <div class="wrap">
+    <div class="cta-panel">
+      <h2>One command. <span class="grad-text">Your own Touch Bar.</span></h2>
+      <p>Build the workspace, then run the Control Center against the physical panel:</p>
+      <code class="win" style="display:inline-block;text-align:left;padding:12px 18px;font-size:13px">cargo run --example control-center -- --drm</code>
+      <br><br>
+      <a class="btn" href="https://dev-muhammad-adel.github.io/touchbard/install.sh">Install with one line →</a>
+      <p style="margin-top:22px;margin-bottom:0;font-size:13px">Also: <code>cargo test --workspace</code> for the protocol, input, routing and backend-boundary suites.</p>
+    </div>
+  </div>
+</section>
+
+<footer>
+  <div class="wrap">
+    <div class="motto">Same idea. More possibilities.</div>
+    <div>Made with Rust on Linux · Fast · Safe · Open Source</div>
+  </div>
+</footer>
+
+<script>
+  document.querySelectorAll('[id="copy-install"], .copy').forEach(btn => {
+    btn.addEventListener('click', () => {
+      const txt = 'curl -fsSL https://dev-muhammad-adel.github.io/touchbard/install.sh | bash';
+      navigator.clipboard?.writeText(txt);
+      btn.textContent = '✓'; btn.classList.add('copied');
+      setTimeout(() => { btn.textContent = '⧉'; btn.classList.remove('copied'); }, 1400);
+    });
+  });
+</script>
+</body>
+</html>
