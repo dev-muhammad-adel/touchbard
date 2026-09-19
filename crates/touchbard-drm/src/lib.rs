@@ -285,13 +285,20 @@ impl Backend for DrmBackend {
         let mut last_frame: Option<Frame> = None;
 
         loop {
+            // Wait exactly the remaining slice to the cadence boundary whenever
+            // a frame is due — a coalesced one or, while animating, the next
+            // tick. Bounding the wait on the last present (not a fresh full
+            // cadence) keeps render starts, and therefore `now` sampled at
+            // them, exactly one cadence apart regardless of render cost, so the
+            // presented animation advances in uniform steps. Without a due
+            // frame the wait drags until something wakes us.
             let animating = source.borrow().needs_redraw();
-            let pending = source.borrow().frame_pending();
-            let budget = if animating || pending {
+            let deadline = source.borrow().frame_deadline();
+            let budget = deadline.or(if animating {
                 Some(wakefd::ANIM_TICK)
             } else {
                 None
-            };
+            });
             wake.wait(budget)?;
 
             while let Some(event) = lifecycle.as_ref().and_then(|watcher| watcher.try_recv()) {

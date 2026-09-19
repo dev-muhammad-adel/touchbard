@@ -5,12 +5,18 @@ use std::task::Waker;
 use crate::{Frame, PointerEvent};
 
 /// The presentation cadence: change-driven frames are coalesced to at most one
-/// per period (≈60 Hz on a 60 Hz touch bar). A burst of scheduler wakeups — for
-/// example a high-frequency timer updating state — must not each force their
-/// own rasterize; the newest state is presented instead, at most one period
-/// late. This is the same bound a backend already applies while a document is
-/// animating; here it is the general upper bound shared by every backend.
-pub const FRAME_CADENCE: std::time::Duration = std::time::Duration::from_millis(16);
+/// per period (exactly 60 Hz — one 16.66 ms cadence per vertical blank of a
+/// 60 Hz panel). A burst of scheduler wakeups — for example a high-frequency
+/// timer updating state — must not each force their own rasterize; the newest
+/// state is presented instead, at most one period late. This is the same bound a
+/// backend already applies while a document is animating; here it is the general
+/// upper bound shared by every backend.
+///
+/// The cadence is exactly `1/60 s`, *not* a rounded `16 ms`: presentation must
+/// land on the display's refresh grid. A 16 ms period drifts 0.66 ms against a
+/// 16.66 ms refresh, so the present phase slides across the scan every few
+/// frames — a beat that reads as shaking/jumping just after the motion starts.
+pub const FRAME_CADENCE: std::time::Duration = std::time::Duration::from_nanos(1_000_000_000 / 60);
 
 /// A viewport-agnostic runtime shell that produces frames and accepts pointer
 /// input.
@@ -76,5 +82,22 @@ pub trait FrameSource {
     /// within one cadence instead of being lost while the backend blocks.
     fn frame_pending(&self) -> bool {
         false
+    }
+
+    /// When a frame is due, the time remaining until it is due on the
+    /// [`FRAME_CADENCE`] boundary — either because one was coalesced and is
+    /// now pending, or because the document is animating (so the backend
+    /// bounds its wait to keep the animation advancing).
+    ///
+    /// A backend about to wait must use this as its bound rather than a fresh,
+    /// full [`FRAME_CADENCE`] — otherwise the period restarts after the
+    /// previous present and its render, stretching the presented interval and
+    /// making animation advance by unequal steps frame to frame (perceived as
+    /// jumping/shaking). Waiting exactly the remaining slice lands the next
+    /// frame on the cadence boundary, so the present rate stays uniform.
+    /// `None` when nothing is due and the caller should block until it is
+    /// woken.
+    fn frame_deadline(&self) -> Option<std::time::Duration> {
+        None
     }
 }

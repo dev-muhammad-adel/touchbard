@@ -549,6 +549,12 @@ async fn handle_connection(
         // blocks on input/wake/keepalive.
         let animating = source.borrow().needs_redraw();
         let pending = source.borrow().frame_pending();
+        // Wait only the remaining slice to the cadence boundary whenever a
+        // frame is due — a coalesced one or the next animation tick — not a
+        // full ANIM_TICK (which would restart the period after the last present
+        // *and its render*, stretching the present interval and making
+        // animation advance by unequal steps).
+        let deadline = source.borrow().frame_deadline();
 
         let wait_start = std::time::Instant::now();
         tokio::select! {
@@ -607,7 +613,7 @@ async fn handle_connection(
             }
             _ = frame_wake.notify.notified() => {}
             _ = kick.notify.notified() => {}
-            _ = tokio::time::sleep(ANIM_TICK), if animating || pending => {}
+            _ = tokio::time::sleep(deadline.unwrap_or(ANIM_TICK)), if animating || pending => {}
         }
 
         // Keepalive/RTT probe: the sleep-arm version above never fires while

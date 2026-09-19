@@ -281,6 +281,30 @@ impl TouchbardSystem {
         self.render_pending
     }
 
+    /// The time remaining until a frame is due on the cadence boundary.
+    ///
+    /// A present is imminent when a coalesced frame is pending (it is due
+    /// exactly on the boundary) or when the document is animating (a backend
+    /// bounds its wait so the animation keeps advancing). In both cases a
+    /// backend must wait this long — not a fresh, full [`FRAME_CADENCE`] —
+    /// before calling [`frame`](Self::frame). Waiting a full cadence after the
+    /// previous present returns *after* the render of that frame, so the next
+    /// render starts one cadence *plus one render duration* later; with a
+    /// variable render cost the present interval varies frame to frame and
+    /// animation advances by unequal steps (jumping/shaking). Waiting exactly
+    /// the remaining slice lands the next present on the cadence boundary
+    /// relative to the last one, so the present rate stays uniform. `None` when
+    /// nothing is due and the caller should block until it is woken.
+    pub fn frame_deadline(&self) -> Option<std::time::Duration> {
+        if !(self.render_pending || self.needs_redraw()) {
+            return None;
+        }
+        self.last_present.map(|t| {
+            touchbard_renderer::frame_source::FRAME_CADENCE
+                .saturating_sub(t.elapsed())
+        })
+    }
+
     /// Handle a pointer event from any backend (preview WebSocket, touch device).
     ///
     /// Coordinates are in logical (CSS) pixels.
@@ -382,6 +406,10 @@ impl FrameSource for TouchbardSystem {
 
     fn frame_pending(&self) -> bool {
         self.frame_pending()
+    }
+
+    fn frame_deadline(&self) -> Option<std::time::Duration> {
+        self.frame_deadline()
     }
 }
 
@@ -680,6 +708,55 @@ mod tests {
 
         // The next scheduling step poll pumps the mutation and renders.
         assert!(sys.frame(Some(waker)).is_some(), "changed document renders");
+    }
+
+    #[test]
+    fn test_coalesced_frame_exposes_cadence_deadline() {
+        let _guard = render_lock();
+        let config = Viewport {
+            width: 2008,
+            height: 60,
+            scale_factor: 1.0,
+        };
+        let mut sys = TouchbardSystem::new(animated_app, config);
+        assert!(sys.frame(None).is_some(), "initial render");
+
+        // A wake arriving inside the cadence is deferred and reported pending,
+        // not silently dropped. Whether one can actually land inside the 16ms
+        // window depends on how fast a single full-bar raster is on this
+        // machine: when it is ≥ a cadence, every change is already ≥ a cadence
+        // apart and the deferral never arises (the double-wait failure mode
+        // cannot occur either), so the pending branch below is best-effort.
+        let mut deferred = false;
+        for _ in 0..8 {
+            if sys.frame(None).is_none() {
+                deferred = true;
+                break;
+            }
+        }
+        if deferred {
+            assert!(sys.frame_pending(), "deferred frame is reported pending");
+            let deadline = sys.frame_deadline().expect(
+                "a pending frame exposes the remaining cadence deadline",
+            );
+            assert!(
+                deadline > std::time::Duration::ZERO
+                    && deadline <= touchbard_renderer::frame_source::FRAME_CADENCE,
+                "deadline is the remaining slice to the cadence boundary: {deadline:?}"
+            );
+
+            // Honoring the deadline (a backend sleeps it) presents the deferred
+            // frame on the cadence boundary — one period, not two.
+            std::thread::sleep(deadline);
+            assert!(
+                sys.frame(None).is_some(),
+                "the pending frame presents after the deadline"
+            );
+            assert!(
+                !sys.frame_pending(),
+                "pending flag clears once the frame presents"
+            );
+        }
     }
 
     #[test]
