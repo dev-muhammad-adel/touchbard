@@ -62,12 +62,24 @@ if (DIAG) {
   }, 500);
 }
 
+const DEFAULT_HOST = "127.0.0.1:8888";
+
+// Set when the server rejects this connection because another preview client is
+// already connected (BUSY). A rejected tab stops reconnecting instead of
+// hammering the server every second.
+let rejected = false;
+
 function connect() {
+  // When the page is opened directly from disk (file://) there is no server
+  // host; fall back to the preview server's default address.
+  const host = location.host || DEFAULT_HOST;
   const proto = location.protocol === "https:" ? "wss" : "ws";
-  ws = new WebSocket(`${proto}://${location.host}/ws`);
+  rejected = false;
+  ws = new WebSocket(`${proto}://${host}/ws`);
   ws.binaryType = "arraybuffer";
 
   ws.onopen = () => {
+    if (rejected) return;
     hud.textContent = "connected";
   };
 
@@ -80,6 +92,11 @@ function connect() {
   };
 
   ws.onclose = () => {
+    if (rejected) {
+      // Another tab owns the preview; do not fight it for the slot.
+      hud.textContent = "another preview is already connected";
+      return;
+    }
     hud.textContent = "disconnected — reconnecting…";
     setTimeout(connect, 1000);
   };
@@ -90,6 +107,13 @@ function connect() {
 }
 
 function handleText(text) {
+  if (text.startsWith("BUSY")) {
+    // The server already has a live preview client; stop trying.
+    rejected = true;
+    hud.textContent = "another preview is already connected";
+    ws.close();
+    return;
+  }
   if (text.startsWith("HELLO ")) {
     const h = JSON.parse(text.slice(6));
     if (h.protocol_version !== PROTOCOL_VERSION) {
@@ -114,23 +138,33 @@ function applySize(width, height) {
   frameHeight = height;
   canvas.width = width;
   canvas.height = height;
-  // Keep the whole strip visible: scale it down to fit the window, never above 2x.
+  // Keep the whole strip visible at the exact 2008:60 ratio: scale it to fit
+  // the stage area (header/footer included), never above 2x.
   const fit = scaleToFit(width, height);
-  canvas.style.width = `${width * fit}px`;
+  // canvas.style.width = `${width * fit}px`;
   canvas.style.height = `${height * fit}px`;
 }
 
+// Available display area: the stage host (minus the bezel wrapper padding) when
+// present, otherwise the window. Keeps both dimensions in physical px.
 function scaleToFit(width, height) {
-  const margin = 24;
-  const availW = Math.max(100, window.innerWidth - margin);
-  const availH = Math.max(60, window.innerHeight - margin);
+  const host = document.getElementById("stageHost");
+  const margin = 26; // bezel padding + borders on both sides
+  const availW = Math.max(100, (host ? host.clientWidth : window.innerWidth) - margin);
+  const availH = Math.max(60, (host ? host.clientHeight : window.innerHeight) - margin);
   return Math.max(0.2, Math.min(2.0, availW / width, availH / height));
 }
 
-// Re-scale on window changes so the whole strip stays visible/clickable.
-window.addEventListener("resize", () => {
+// Re-scale whenever the stage area changes (window resizes, bar heights move)
+// so the whole strip stays visible and the ratio exact.
+function rescale() {
   if (frameWidth > 0 && frameHeight > 0) applySize(frameWidth, frameHeight);
-});
+}
+window.addEventListener("resize", rescale);
+const stageHost = document.getElementById("stageHost");
+if (stageHost && typeof ResizeObserver === "function") {
+  new ResizeObserver(rescale).observe(stageHost);
+}
 
 function handleBinary(bytes) {
   const type = bytes[0];

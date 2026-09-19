@@ -15,15 +15,12 @@
 //! Hence `Rc<RefCell<dyn FrameSource>>` and `spawn_local`, driven by a
 //! current-thread Tokio runtime + `LocalSet`.
 //!
-//! Known limitation with multiple connections: every connection drives the one
-//! shared runtime, which holds a single host waker — only the connection that
-//! most recently armed it is fed. Incoming events on one tab while another has
-//! the waker armed can wake the wrong connection, so the server supports a
-//! single live preview client at a time. Rather than rejecting the newcomer,
-//! the policy is **last-wins**: a new connection immediately seizes the shared
-//! slot and politely closes the previous one, so a stale tab from an earlier
-//! run is evicted instead of spinning forever in a
-//! "disconnected — reconnecting…" loop.
+//! Multiple clients: the runtime keeps a single host waker (the scheduler and
+//! shell-redraw bridges store exactly one), so exactly one **producer** task
+//! owns the waker, renders frames and broadcasts them to a `tokio::sync::broadcast`
+//! group. Every connected browser subscribes to the group and receives the same
+//! frames; pointer events from any tab feed the one shared runtime, so all tabs
+//! show a single shared UI state.
 
 use crate::protocol::{self, Hello};
 use touchbard_renderer::{
@@ -31,7 +28,6 @@ use touchbard_renderer::{
 };
 
 use futures_util::{SinkExt, StreamExt};
-use std::cell::Cell;
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
@@ -40,52 +36,15 @@ use std::task::{Wake, Waker};
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
+use tokio::sync::broadcast::error::RecvError;
 use tokio::sync::Notify;
-use tokio_tungstenite::tungstenite::protocol::CloseFrame;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::WebSocketStream;
 use tracing::{info, warn};
 
-/// Shared single-client state: whichever connection currently holds the slot is
-/// the one driving the runtime.
-type ClientSlots = Rc<RefCell<Option<Rc<ClientKick>>>>;
-
-/// A per-connection "kick" handle. The runtime arms a single host waker, so a
-/// second live connection is not supported; when a new connection arrives it
-/// seizes the slot and closes the previous one instead of being rejected.
-struct ClientKick {
-    closed: Cell<bool>,
-    notify: Notify,
-}
-
-/// RAII guard that frees the active-client slot when a connection drops — but
-/// only if the slot still points at this connection, so the connection evicted
-/// by a replacement does not clear the new owner.
-struct ActiveClientGuard {
-    slots: ClientSlots,
-    kick: Rc<ClientKick>,
-}
-
-impl Drop for ActiveClientGuard {
-    fn drop(&mut self) {
-        let is_owner = matches!(
-            &*self.slots.borrow(),
-            Some(current) if Rc::ptr_eq(current, &self.kick)
-        );
-        if is_owner {
-            self.slots.borrow_mut().take();
-        }
-    }
-}
-
-/// Upper bound on the animation cadence (≈60 Hz): while the runtime reports it
-/// is animating, the connection loop asks for a frame every [`ANIM_TICK`]. Not
-/// a fixed render rate — an idle document blocks on the WebSocket/wake select.
-const ANIM_TICK: Duration = touchbard_renderer::frame_source::FRAME_CADENCE;
-
 /// The [`Wake`] that completes a connection's [`Notify`]: Dioxus scheduler
-/// wakeups and shell redraw requests unblock the connection's select loop so
-/// it can ask the runtime whether there is a frame to send.
+/// wakeups and shell redraw requests unblock the producer's select loop so it
+/// can ask the runtime whether there is a frame to send.
 struct FrameWake {
     notify: Notify,
 }
@@ -100,6 +59,17 @@ impl Wake for FrameWake {
     }
 }
 
+/// Most recently broadcast frame, so a freshly connected client can show the
+/// current UI immediately instead of waiting for the next change.
+///
+/// `Message` clones are cheap for binary frames (a `Bytes` refcount bump), so
+/// the snapshot recorded here shares the producer's encoded buffer.
+type LatestFrame = Rc<RefCell<Option<Message>>>;
+
+/// Capacity of the frame fan-out channel: a small ring buffer is plenty — a
+/// slow subscriber that falls behind resubscribes and jumps to the latest.
+const BROADCAST_CAPACITY: usize = 4;
+
 /// Static files served by the preview HTTP server, keyed by path.
 pub const INDEX_HTML: &str = include_str!("../../../preview/index.html");
 pub const PREVIEW_JS: &str = include_str!("../../../preview/preview.js");
@@ -112,7 +82,8 @@ pub const DEFAULT_HEIGHT: u32 = 60;
 /// pixels (1:1 with the Touch Bar's native resolution), so the default is `1.0`.
 /// Raise it with `TOUCHBARD_SCALE` for a smaller CSS-pixel grid.
 pub const DEFAULT_SCALE: f64 = 1.0;
-/// Default bind address for the HTTP/WebSocket server.
+/// Default bind address for the HTTP/WebSocket server. A new instance takes
+/// this port over from a stale one (see [`bind_listener`]).
 pub const DEFAULT_BIND_ADDR: &str = "127.0.0.1:8888";
 
 /// Configuration for the preview backend.
@@ -253,6 +224,161 @@ impl Backend for PreviewBackend {
     }
 }
 
+/// Create a fresh socket, enable `SO_REUSEADDR` and bind+listen on `sock_addr`.
+/// A fresh socket per call, so a failed (EADDRINUSE) bind can be retried.
+fn bind_one(
+    domain: socket2::Domain,
+    sock_addr: &socket2::SockAddr,
+) -> Result<tokio::net::TcpListener, std::io::Error> {
+    let sock = socket2::Socket::new(domain, socket2::Type::STREAM, None)?;
+    sock.set_reuse_address(true)?;
+    sock.set_nonblocking(true)?;
+    sock.bind(sock_addr)?;
+    sock.listen(1024)?;
+    let std_listener: std::net::TcpListener =
+        sock.try_into().expect("socket -> TcpListener conversion never fails");
+    tokio::net::TcpListener::from_std(std_listener)
+}
+
+/// Bind the preview listener to `address`, taking the port over from a stale
+/// instance if one is still listening on it.
+///
+/// The socket gets `SO_REUSEADDR` so a killed predecessor's lingering
+/// `TIME_WAIT` sockets can never block a rebind, and on `Address already in
+/// use` the stale instance of this app holding the port is killed and the bind
+/// is retried — a fresh `--preview` run always displaces its predecessor
+/// instead of dying with `os error 98`.
+async fn bind_listener(
+    address: &str,
+) -> Result<tokio::net::TcpListener, Box<dyn std::error::Error + Send + Sync>> {
+    let (domain, sock_addr) = match address.parse::<std::net::SocketAddr>() {
+        Ok(addr @ std::net::SocketAddr::V4(_)) => {
+            (socket2::Domain::IPV4, socket2::SockAddr::from(addr))
+        }
+        Ok(addr @ std::net::SocketAddr::V6(_)) => {
+            (socket2::Domain::IPV6, socket2::SockAddr::from(addr))
+        }
+        Err(_) => {
+            return Err(format!("invalid bind address: {address}").into());
+        }
+    };
+
+    match bind_one(domain, &sock_addr) {
+        Ok(listener) => return Ok(listener),
+        Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {
+            let port = sock_addr.as_socket().map_or(0, |a| a.port());
+            warn!("{address} is already in use; killing the stale instance to take the port over");
+            kill_stale_listeners(port);
+        }
+        Err(e) => return Err(Box::new(e)),
+    }
+
+    // The killed process must die and hand back the socket before the rebind
+    // can succeed; retry briefly.
+    for _ in 0..40 {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        if let Ok(listener) = bind_one(domain, &sock_addr) {
+            return Ok(listener);
+        }
+    }
+    Err(format!("{address} is still in use after reclaiming it").into())
+}
+
+/// Kill stale instances of this app that are listening on `port` so a new
+/// process can take the port over. Only processes whose `comm` matches this
+/// binary are killed — never an unrelated app. No-op on non-Linux.
+#[cfg(target_os = "linux")]
+fn kill_stale_listeners(port: u16) {
+    use std::collections::HashSet;
+    use std::fs;
+
+    if port == 0 {
+        return;
+    }
+
+    // Map port -> listening socket inodes by scanning the kernel's TCP tables.
+    let port_hex = format!("{port:X}");
+    let mut listeners = HashSet::new();
+    for table in ["/proc/net/tcp", "/proc/net/tcp6"] {
+        let Ok(contents) = fs::read_to_string(table) else {
+            continue;
+        };
+        for line in contents.lines().skip(1) {
+            let fields: Vec<&str> = line.split_whitespace().collect();
+            if fields.len() <= 9 {
+                continue;
+            }
+            // local_address is `IP:PORT` in hex, state `0A` = LISTEN.
+            if fields[3] != "0A" {
+                continue;
+            }
+            if !fields[1].to_ascii_uppercase().ends_with(&format!(":{port_hex}")) {
+                continue;
+            }
+            if let Ok(inode) = fields[9].parse::<u64>() {
+                listeners.insert(inode);
+            }
+        }
+    }
+    if listeners.is_empty() {
+        return;
+    }
+
+    // Walk every process, owning the listener inode via a socket: fd symlink.
+    let Ok(entries) = fs::read_dir("/proc") else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let Some(pid) = entry
+            .file_name()
+            .to_str()
+            .and_then(|n| n.parse::<u32>().ok())
+        else {
+            continue;
+        };
+        let pid_dir = entry.path();
+        let owns = || -> bool {
+            let Ok(fds) = fs::read_dir(pid_dir.join("fd")) else {
+                return false;
+            };
+            for fd in fds.flatten() {
+                let Ok(target) = fs::read_link(fd.path()) else {
+                    continue;
+                };
+                let target = target.to_string_lossy().to_string();
+                if let Some(inode) = target
+                    .strip_prefix("socket:[")
+                    .and_then(|s| s.strip_suffix(']'))
+                    .and_then(|s| s.parse::<u64>().ok())
+                {
+                    if listeners.contains(&inode) {
+                        return true;
+                    }
+                }
+            }
+            false
+        };
+        if !owns() {
+            continue;
+        }
+        // Safety: never kill an unrelated app — only this binary's comm.
+        let Ok(comm) = fs::read_to_string(pid_dir.join("comm")) else {
+            continue;
+        };
+        if comm.trim() != "control-center" {
+            continue;
+        }
+        info!("Killing stale control-center pid {pid} holding the preview port");
+        let _ = std::process::Command::new("kill")
+            .arg("-9")
+            .arg(pid.to_string())
+            .status();
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn kill_stale_listeners(_port: u16) {}
+
 /// Best-effort: open the browser on the host.
 #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
 fn open_browser(addr: &str) -> Result<(), ()> {
@@ -287,23 +413,122 @@ async fn serve(
     viewport: Viewport,
     source: Rc<RefCell<dyn FrameSource>>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let listener = tokio::net::TcpListener::bind(&config.bind_addr).await?;
+    let listener = bind_listener(&config.bind_addr).await?;
     info!("Preview server listening on http://{}", config.bind_addr);
 
-    // Single-client server: at most one live preview connection at a time (see
-    // module docs). A new connection seizes the slot and kicks the previous one.
-    let slots: ClientSlots = Rc::default();
+    // Fan-out group: one producer owns the single host waker, renders frames
+    // and broadcasts them; every connected client subscribes to the same group.
+    let (tx, _) = tokio::sync::broadcast::channel::<Message>(BROADCAST_CAPACITY);
+    let latest: LatestFrame = Rc::default();
+    tokio::task::spawn_local(run_frame_producer(
+        Rc::clone(&source),
+        tx.clone(),
+        Rc::clone(&latest),
+    ));
+
+    // Graceful Ctrl+C: stop accepting and return, so the process exits and the
+    // socket is released. With no handler SIGINT kills the process abruptly;
+    // with one, shutdown is explicit and logged.
+    let shutdown = tokio::signal::ctrl_c();
+    tokio::pin!(shutdown);
 
     loop {
-        let (stream, addr) = listener.accept().await?;
-        let source = Rc::clone(&source);
-        let slots = Rc::clone(&slots);
-        tokio::task::spawn_local(async move {
-            if let Err(e) = handle_connection(stream, viewport, source, slots).await {
-                warn!("Connection {addr} error: {e}");
+        tokio::select! {
+            accepted = listener.accept() => {
+                let (stream, addr) = accepted?;
+                let source = Rc::clone(&source);
+                let latest = Rc::clone(&latest);
+                let rx = tx.subscribe();
+                tokio::task::spawn_local(async move {
+                    if let Err(e) = handle_connection(stream, viewport, source, latest, rx).await {
+                        warn!("Connection {addr} error: {e}");
+                    }
+                });
             }
-        });
+            _ = &mut shutdown => {
+                info!("Shutting down on Ctrl+C — releasing {}", config.bind_addr);
+                return Ok(());
+            }
+        }
     }
+}
+
+/// Upper bound on the animation cadence (≈60 Hz): while the runtime reports it
+/// is animating, the producer asks for a frame every [`ANIM_TICK`]. Not a fixed
+/// render rate — an idle document blocks until woken.
+const ANIM_TICK: Duration = touchbard_renderer::frame_source::FRAME_CADENCE;
+
+/// The one task that drives the shared runtime: it owns the single host waker,
+/// renders frames when woken and broadcasts every present to the client group.
+///
+/// The runtime keeps exactly one armed waker (see module docs), so no client
+/// task may call [`FrameSource::frame`]. A freshly connected client receives
+/// the [`LatestFrame`] snapshot immediately; the producer's broadcast keeps it
+/// current from then on.
+async fn run_frame_producer(
+    source: Rc<RefCell<dyn FrameSource>>,
+    tx: tokio::sync::broadcast::Sender<Message>,
+    latest: LatestFrame,
+) {
+    let frame_wake = Arc::new(FrameWake {
+        notify: Notify::new(),
+    });
+    let waker: &'static Waker = Box::leak(Box::new(Waker::from(Arc::clone(&frame_wake))));
+
+    // Initial present: the first `frame(Some(waker))` is guaranteed non-empty
+    // (see `FrameSource::frame`) and arms the host waker for every later
+    // scheduler/shell wake — mirroring the per-connection initial push the old
+    // single-client loop did on connect.
+    let frame = source.borrow_mut().frame(Some(waker));
+    if let Some(frame) = frame {
+        publish_frame(tx.clone(), &latest, frame);
+    }
+
+    loop {
+        // The animation-tick branch is armed only while the document is
+        // animating (or a frame is coalesced pending); otherwise the producer
+        // blocks on the host wake.
+        let animating = source.borrow().needs_redraw();
+        let pending = source.borrow().frame_pending();
+        // Wait only the remaining slice to the cadence boundary whenever a
+        // frame is due — a coalesced one or the next animation tick — not a
+        // full ANIM_TICK (which would restart the period after the last present
+        // *and its render*, stretching the present interval and making
+        // animation advance by unequal steps).
+        let deadline = source.borrow().frame_deadline();
+
+        let wait_start = std::time::Instant::now();
+        tokio::select! {
+            _ = frame_wake.notify.notified() => {}
+            _ = tokio::time::sleep(deadline.unwrap_or(ANIM_TICK)), if animating || pending => {}
+        }
+
+        // One scheduling decision per wake, whichever reason woke the select:
+        // present a frame only when the runtime says there is something new.
+        touchbard_renderer::diag::record(touchbard_renderer::diag::Ev::Wait {
+            wait_us: wait_start.elapsed().as_micros() as u64,
+        });
+        let frame = source.borrow_mut().frame(Some(waker));
+        if let Some(frame) = frame {
+            publish_frame(tx.clone(), &latest, frame);
+        }
+    }
+}
+
+/// Encode one frame once and fan it out: record it as the latest snapshot and
+/// broadcast the shared buffer to every subscriber. Sending to a channel with
+/// no live receivers errors and is ignored — nobody is looking.
+fn publish_frame(tx: tokio::sync::broadcast::Sender<Message>, latest: &LatestFrame, frame: touchbard_renderer::Frame) {
+    touchbard_renderer::diag::record(touchbard_renderer::diag::Ev::SendStart);
+    let present_start = std::time::Instant::now();
+    let message = protocol::frame(frame.width, frame.height, &frame.data);
+    // Snapshot first so a client subscribing right now either sees it here or
+    // receives it on the group — never a gap (a duplicate is harmless).
+    *latest.borrow_mut() = Some(message.clone());
+    let _ = tx.send(message);
+    touchbard_renderer::diag::record(touchbard_renderer::diag::Ev::Present {
+        present_us: present_start.elapsed().as_micros() as u64,
+    });
 }
 
 const MAX_HEADER_SIZE: usize = 16 * 1024;
@@ -403,7 +628,8 @@ async fn handle_connection(
     mut stream: TcpStream,
     viewport: Viewport,
     source: Rc<RefCell<dyn FrameSource>>,
-    slots: ClientSlots,
+    latest: LatestFrame,
+    mut rx: tokio::sync::broadcast::Receiver<Message>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     stream.set_nodelay(true).ok();
 
@@ -473,39 +699,10 @@ async fn handle_connection(
 
     info!("WebSocket connection established");
 
-    // Last-wins single-client policy: the runtime arms exactly one host waker,
-    // so a second live connection would steal wakes from the current one.
-    // Instead of rejecting the newcomer, it seizes the slot and politely closes
-    // the previous connection (a stale tab from an earlier run is evicted
-    // rather than left retrying forever).
-    let kick = Rc::new(ClientKick {
-        closed: Cell::new(false),
-        notify: Notify::new(),
-    });
-    let previous = slots.borrow_mut().replace(Rc::clone(&kick));
-    if let Some(previous) = previous {
-        info!("Replacing previous preview client (last-wins)");
-        previous.closed.set(true);
-        previous.notify.notify_one();
-    }
-    let _active_guard = ActiveClientGuard {
-        slots: Rc::clone(&slots),
-        kick: Rc::clone(&kick),
-    };
-
-    // Host wake bridge: the runtime registers this waker on the Dioxus
-    // scheduler and the shell redraw bridge; either unblocks the select below
-    // so it asks the runtime for a frame. Dioxus needs a `&'static` waker, so
-    // one is leaked per connection (bounded: connections run for the process
-    // lifetime).
-    let frame_wake = Arc::new(FrameWake {
-        notify: Notify::new(),
-    });
-    let waker: &'static Waker = Box::leak(Box::new(Waker::from(Arc::clone(&frame_wake))));
-
     // Send HELLO with framebuffer dimensions (the authoritative viewport
-    // discovered at backend initialization), then push the current frame so the
-    // canvas shows content immediately on connect/reconnect.
+    // discovered at backend initialization), then the latest frame snapshot so
+    // the canvas shows current content immediately on connect/reconnect, even
+    // while the document is idle.
     {
         let hello = Hello {
             protocol_version: protocol::PROTOCOL_VERSION,
@@ -516,47 +713,16 @@ async fn handle_connection(
         if ws.send(protocol::hello(&hello)).await.is_err() {
             return Ok(());
         }
-        // Bind the frame to a local so the `RefMut` borrow drops before the
-        // await below; holding `source.borrow_mut()` across `ws.send().await`
-        // panics ("already borrowed") the moment a second connection tries to
-        // borrow the same shell (see frame()/waker scheduling docs).
-        let frame = source.borrow_mut().frame(Some(waker));
-        if let Some(frame) = frame {
-            let _ = ws
-                .send(protocol::frame(frame.width, frame.height, &frame.data))
-                .await;
+        if let Some(snapshot) = latest.borrow().clone() {
+            if ws.send(snapshot).await.is_err() {
+                return Ok(());
+            }
         }
     }
 
     let mut close = false;
     let mut last_ping = std::time::Instant::now();
     while !close {
-        // A newer connection seized the slot: close this one gracefully and
-        // let the replacement drive the runtime.
-        if kick.closed.get() {
-            info!("Kicking preview client replaced by a newer connection");
-            let _ = ws
-                .send(Message::Close(Some(CloseFrame {
-                    code: tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode::Normal,
-                    reason: "replaced by a newer preview client".into(),
-                })))
-                .await;
-            break;
-        }
-
-        // The animation-tick branch is armed only while the document is
-        // animating (or a frame is coalesced pending); otherwise the connection
-        // blocks on input/wake/keepalive.
-        let animating = source.borrow().needs_redraw();
-        let pending = source.borrow().frame_pending();
-        // Wait only the remaining slice to the cadence boundary whenever a
-        // frame is due — a coalesced one or the next animation tick — not a
-        // full ANIM_TICK (which would restart the period after the last present
-        // *and its render*, stretching the present interval and making
-        // animation advance by unequal steps).
-        let deadline = source.borrow().frame_deadline();
-
-        let wait_start = std::time::Instant::now();
         tokio::select! {
             msg = ws.next() => {
                 match msg {
@@ -611,15 +777,28 @@ async fn handle_connection(
                     None => close = true,
                 }
             }
-            _ = frame_wake.notify.notified() => {}
-            _ = kick.notify.notified() => {}
-            _ = tokio::time::sleep(deadline.unwrap_or(ANIM_TICK)), if animating || pending => {}
+            frame = rx.recv() => {
+                match frame {
+                    // Frame from the shared producer: forward it as-is. Binary
+                    // payloads share the producer's buffer (a refcount bump).
+                    Ok(msg) => {
+                        if ws.send(msg).await.is_err() {
+                            close = true;
+                        }
+                    }
+                    // Fell behind the producer: resubscribe to jump to the
+                    // latest frame instead of replaying the backlog stale ones.
+                    Err(RecvError::Lagged(_)) => {
+                        rx = rx.resubscribe();
+                    }
+                    // Producer gone (server shutting down): close.
+                    Err(RecvError::Closed) => close = true,
+                }
+            }
         }
 
-        // Keepalive/RTT probe: the sleep-arm version above never fires while
-        // the animation tick keeps the select busy, so ping on a plain elapsed
-        // check instead. The browser echoes the timestamp in a binary PONG
-        // that is decoded in the `ws.next()` arm above.
+        // Keepalive/RTT probe: the browser echoes the timestamp in a binary
+        // PONG decoded in the `ws.next()` arm above.
         if last_ping.elapsed() > Duration::from_secs(1) {
             let _ = ws.send(protocol::ping(nanos_now())).await;
             last_ping = std::time::Instant::now();
@@ -629,27 +808,6 @@ async fn handle_connection(
         // frame send.
         if close {
             break;
-        }
-
-        // One scheduling decision per wake, whichever reason woke the select:
-        // present a frame only when the runtime says there is something new.
-        touchbard_renderer::diag::record(touchbard_renderer::diag::Ev::Wait {
-            wait_us: wait_start.elapsed().as_micros() as u64,
-        });
-        // Bind the frame to a local so the `RefMut` borrow drops before the
-        // await below; holding `source.borrow_mut()` across `ws.send().await`
-        // panics ("already borrowed") the moment a second connection tries to
-        // borrow the same shell.
-        let frame = source.borrow_mut().frame(Some(waker));
-        if let Some(frame) = frame {
-            touchbard_renderer::diag::record(touchbard_renderer::diag::Ev::SendStart);
-            let present_start = std::time::Instant::now();
-            let _ = ws
-                .send(protocol::frame(frame.width, frame.height, &frame.data))
-                .await;
-            touchbard_renderer::diag::record(touchbard_renderer::diag::Ev::Present {
-                present_us: present_start.elapsed().as_micros() as u64,
-            });
         }
     }
 
@@ -808,6 +966,71 @@ mod ws_integration_tests {
         }
     }
 
+    /// Spin up the fan-out preview server (one producer + per-connection
+    /// handlers) on an ephemeral port and return the WebSocket URL.
+    ///
+    /// Mirrors what `serve` does after binding: the producer owns the single
+    /// host waker and broadcasts frames; every accepted connection subscribes
+    /// to the group.
+    async fn spawn_server(
+        source: Rc<RefCell<dyn FrameSource>>,
+        viewport: Viewport,
+    ) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("local addr");
+
+        let (tx, _) = tokio::sync::broadcast::channel::<Message>(BROADCAST_CAPACITY);
+        let latest: LatestFrame = Rc::default();
+        tokio::task::spawn_local(run_frame_producer(
+            Rc::clone(&source),
+            tx.clone(),
+            Rc::clone(&latest),
+        ));
+        tokio::task::spawn_local({
+            let source = Rc::clone(&source);
+            let latest = Rc::clone(&latest);
+            async move {
+                loop {
+                    let (stream, _) = listener.accept().await.expect("accept");
+                    let source = Rc::clone(&source);
+                    let latest = Rc::clone(&latest);
+                    let rx = tx.subscribe();
+                    tokio::task::spawn_local(async move {
+                        let _ = handle_connection(stream, viewport, source, latest, rx).await;
+                    });
+                }
+            }
+        });
+
+        format!("ws://{addr}/ws")
+    }
+
+    /// Count `FRAME` binary messages arriving on `ws` until `want` are seen or
+    /// the deadline passes.
+    async fn count_frames(ws: &mut tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>, want: u32, by: Duration) -> u32 {
+        let mut frames = 0u32;
+        let deadline = tokio::time::sleep(by);
+        tokio::pin!(deadline);
+        loop {
+            tokio::select! {
+                msg = ws.next() => match msg {
+                    Some(Ok(Message::Binary(bytes))) if bytes.first() == Some(&(MsgType::Frame as u8)) => {
+                        frames += 1;
+                        if frames >= want {
+                            return frames;
+                        }
+                    }
+                    Some(Ok(_)) => {}
+                    Some(Err(e)) => panic!("ws error: {e}"),
+                    None => panic!("connection closed unexpectedly"),
+                },
+                _ = &mut deadline => return frames,
+            }
+        }
+    }
+
     /// The server must keep producing frames without any input while the
     /// document is animating (the old loop only rendered when an input message
     /// arrived, which froze CSS animations in the browser).
@@ -828,51 +1051,12 @@ mod ws_integration_tests {
             .expect("current-thread runtime");
 
         local.block_on(&runtime, async {
-            let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-                .await
-                .expect("bind");
-            let addr = listener.local_addr().expect("local addr");
+            let url = spawn_server(Rc::clone(&source), viewport).await;
+            let (mut ws, _) = connect_async(&url).await.expect("websocket upgrade");
 
-            let server_source = Rc::clone(&source);
-            let server_viewport = viewport;
-            let slots: ClientSlots = Rc::default();
-            local.spawn_local(async move {
-                let (stream, _) = listener.accept().await.expect("accept");
-                handle_connection(stream, server_viewport, server_source, slots)
-                    .await
-                    .expect("connection handled");
-            });
-
-            // Let the server arm its accept before the client connects.
-            tokio::task::yield_now().await;
-
-            let (mut ws, _) = connect_async(format!("ws://{addr}/ws"))
-                .await
-                .expect("websocket upgrade");
-
-            // No input is sent. The document animates forever, so the server
+            // No input is sent. The document animates forever, so the producer
             // must keep streaming frames on its own.
-            let mut frames = 0u32;
-            let deadline = tokio::time::sleep(Duration::from_millis(800));
-            tokio::pin!(deadline);
-            loop {
-                tokio::select! {
-                    msg = ws.next() => match msg {
-                        Some(Ok(Message::Binary(bytes))) => {
-                            if bytes.first() == Some(&(MsgType::Frame as u8)) {
-                                frames += 1;
-                                if frames >= 3 {
-                                    break;
-                                }
-                            }
-                        }
-                        Some(Ok(_)) => {}
-                        Some(Err(e)) => panic!("ws error: {e}"),
-                        None => panic!("connection closed unexpectedly"),
-                    },
-                    _ = &mut deadline => break,
-                }
-            }
+            let frames = count_frames(&mut ws, 3, Duration::from_millis(800)).await;
             assert!(
                 frames >= 3,
                 "animated preview must stream frames without input; got {frames}"
@@ -880,14 +1064,12 @@ mod ws_integration_tests {
         });
     }
 
-    /// The server supports exactly one live preview client. Last-wins: when a
-    /// second connection arrives it seizes the slot and kicks the previous one
-    /// (which is closed by the server) instead of rejecting the newcomer.
-    /// Regression for the duplicate-connection crash caused by holding a
-    /// `RefCell` borrow across `ws.send(...).await` while a second connection
-    /// borrowed the same shell.
+    /// The fan-out group serves every connected preview client: each tab
+    /// subscribes to the producer's broadcast and receives the same frames
+    /// concurrently — no BUSY rejection, and no starvation from the single
+    /// shared runtime waker (which the producer alone arms).
     #[test]
-    fn new_preview_client_kicks_the_previous_one() {
+    fn all_clients_receive_broadcast_frames() {
         let viewport = Viewport {
             width: 160,
             height: 60,
@@ -903,73 +1085,19 @@ mod ws_integration_tests {
             .expect("current-thread runtime");
 
         local.block_on(&runtime, async {
-            let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-                .await
-                .expect("bind");
-            let addr = listener.local_addr().expect("local addr");
+            let url = spawn_server(Rc::clone(&source), viewport).await;
 
-            let server_source = Rc::clone(&source);
-            let server_viewport = viewport;
-            let slots: ClientSlots = Rc::default();
-            local.spawn_local(async move {
-                for _ in 0..2 {
-                    let (stream, _) = listener.accept().await.expect("accept");
-                    let source = Rc::clone(&server_source);
-                    let slots = Rc::clone(&slots);
-                    tokio::task::spawn_local(async move {
-                        let _ = handle_connection(stream, server_viewport, source, slots).await;
-                    });
-                }
-            });
-
-            // Let the server arm its accept before the clients connect.
+            let (mut first, _) = connect_async(&url).await.expect("first websocket upgrade");
             tokio::task::yield_now().await;
+            let (mut second, _) = connect_async(&url).await.expect("second websocket upgrade");
 
-            let (mut first, _) = connect_async(format!("ws://{addr}/ws"))
-                .await
-                .expect("first websocket upgrade");
-            tokio::task::yield_now().await;
-
-            let (mut second, _) = connect_async(format!("ws://{addr}/ws"))
-                .await
-                .expect("second websocket upgrade");
-
-            // The second (newest) connection wins the slot: it must keep
-            // receiving frames.
-            let mut frames = 0u32;
-            let deadline = tokio::time::sleep(Duration::from_millis(800));
-            tokio::pin!(deadline);
-            loop {
-                tokio::select! {
-                    msg = second.next() => match msg {
-                        Some(Ok(Message::Binary(bytes))) if bytes.first() == Some(&(MsgType::Frame as u8)) => {
-                            frames += 1;
-                            if frames >= 2 { break; }
-                        }
-                        Some(Ok(_)) => {}
-                        Some(Err(e)) => panic!("second ws error: {e}"),
-                        None => panic!("second (winner) ws closed unexpectedly"),
-                    },
-                    _ = &mut deadline => panic!("second client never received frames"),
-                }
-            }
-            assert!(frames >= 2, "newest client must stream frames; got {frames}");
-
-            // The first connection must have been kicked: the server closes it
-            // instead of the newcomer trying (and failing) to borrow the shell.
-            let deadline = tokio::time::sleep(Duration::from_millis(800));
-            tokio::pin!(deadline);
-            loop {
-                tokio::select! {
-                    msg = first.next() => match msg {
-                        None => break,
-                        Some(Ok(Message::Close(_))) => break,
-                        Some(Ok(_)) => {}
-                        Some(Err(e)) => panic!("kicked client error: {e}"),
-                    },
-                    _ = &mut deadline => panic!("previous client was not kicked"),
-                }
-            }
+            // Both connections must stream the same animation concurrently.
+            let (f1, f2) = tokio::join!(
+                count_frames(&mut first, 3, Duration::from_millis(800)),
+                count_frames(&mut second, 3, Duration::from_millis(800)),
+            );
+            assert!(f1 >= 3, "first client must stream frames; got {f1}");
+            assert!(f2 >= 3, "second client must stream frames; got {f2}");
         });
     }
 }
