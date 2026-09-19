@@ -286,7 +286,8 @@ impl Backend for DrmBackend {
 
         loop {
             let animating = source.borrow().needs_redraw();
-            let budget = if animating {
+            let pending = source.borrow().frame_pending();
+            let budget = if animating || pending {
                 Some(wakefd::ANIM_TICK)
             } else {
                 None

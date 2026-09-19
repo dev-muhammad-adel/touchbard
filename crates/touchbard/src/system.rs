@@ -38,8 +38,11 @@ pub use touchbard_renderer::Viewport;
 ///
 /// When the runtime has no work it returns `None` and a backend blocks until
 /// one of those signals fires again — the presentation rate is event-driven,
-/// with the animation cadence (≈60 Hz, via the backend's bounded wait while
-/// animating) as an upper bound, not a fixed render rate.
+/// and bounded at ≈60 Hz by the shared presentation cadence
+/// ([`FRAME_CADENCE`](touchbard_renderer::frame_source::FRAME_CADENCE)): even a
+/// burst of scheduler wakeups (a high-frequency timer updating state) coalesces
+/// into at most one frame per cadence, so the display never renders at the wake
+/// rate, only at the display's rate.
 ///
 /// Operations:
 ///  1. [`TouchbardSystem::new`] creates the document from a Dioxus app function.
@@ -73,6 +76,17 @@ pub struct TouchbardSystem {
     /// backend's guaranteed first present: a backend that arms its waker must
     /// always receive an initial frame to show.
     presented_once: bool,
+    /// When the last frame was rasterized. Change-driven renders are coalesced
+    /// to at most one per [`FRAME_CADENCE`] so a burst of scheduler wakeups
+    /// (e.g. a high-frequency timer updating state) cannot force a rasterize
+    /// per wake. `None` before the first frame.
+    last_present: Option<std::time::Instant>,
+    /// A change arrived within the cadence and was coalesced: present it on the
+    /// next [`frame`](Self::frame) call. A backend queries this via
+    /// [`frame_pending`](Self::frame_pending) to bound its wait, so the
+    /// deferred frame is presented within one cadence rather than lost while
+    /// the backend blocks.
+    render_pending: bool,
 }
 
 /// Host-wake state shared between the runtime and backends.
@@ -146,6 +160,8 @@ impl TouchbardSystem {
             redraw,
             rendered: false,
             presented_once: false,
+            last_present: None,
+            render_pending: false,
         };
         system.document.initial_build();
         system
@@ -196,11 +212,20 @@ impl TouchbardSystem {
     /// blocking indefinitely, so the animation keeps advancing (see
     /// [`needs_redraw`](Self::needs_redraw)).
     ///
+    /// Change-driven renders are coalesced to at most one per
+    /// [`FRAME_CADENCE`](touchbard_renderer::frame_source::FRAME_CADENCE): a
+    /// change arriving sooner than that after the last present is recorded as
+    /// pending and returned as `None`, so a burst of scheduler wakeups (e.g. a
+    /// high-frequency timer updating state) cannot force a rasterize per wake.
+    /// The pending frame is presented within one cadence; a backend bounds its
+    /// wait for it via [`frame_pending`](Self::frame_pending) exactly like it
+    /// bounds for animations.
+    ///
     /// A backend that arms its waker (`wake: Some`) is guaranteed at least one
     /// frame, its initial present: even if the runtime has already rasterized a
     /// frame with no waker armed (e.g. [`run`](crate::run::run)'s pre-render),
     /// the first host-armed frame still renders. After that, presentation is
-    /// strictly change-driven.
+    /// change-driven within the cadence.
     pub fn frame(&mut self, wake: Option<&'static Waker>) -> Option<Frame> {
         // Consume any redraw request and re-arm the host waker. This happens
         // *before* polling so a wake signalled by Dioxus during the poll is a
@@ -215,7 +240,26 @@ impl TouchbardSystem {
         };
         let changed = self.poll_with(wake);
         let needs_initial_present = wake.is_some() && !self.presented_once;
-        if !self.rendered || needs_initial_present || changed || requested || self.needs_redraw() {
+        if !self.rendered || needs_initial_present || changed || requested || self.needs_redraw()
+            || self.render_pending
+        {
+            // Coalesce change-driven renders to the presentation cadence: a
+            // burst of scheduler wakeups (e.g. a high-frequency timer writing
+            // state) must not each rasterize a frame — that would render at the
+            // wake rate and flood the display. The first frame and each backend's
+            // initial present are exempt (they never wait). A coalesced frame is
+            // recorded as pending so a backend that bounds its wait on
+            // `frame_pending()` comes back within one cadence to present it.
+            let within_cadence = self
+                .last_present
+                .is_some_and(|t| t.elapsed() < touchbard_renderer::frame_source::FRAME_CADENCE);
+            let exempt = !self.rendered || needs_initial_present;
+            if within_cadence && !exempt {
+                self.render_pending = true;
+                return None;
+            }
+            self.render_pending = false;
+            self.last_present = Some(std::time::Instant::now());
             touchbard_renderer::diag::record(touchbard_renderer::diag::Ev::FrameStart {
                 animating: self.needs_redraw(),
             });
@@ -227,6 +271,14 @@ impl TouchbardSystem {
         } else {
             None
         }
+    }
+
+    /// Whether a change was coalesced into the presentation cadence and a frame
+    /// is now due. A backend bounds its wait on this (like `needs_redraw`) so
+    /// the deferred frame is presented within one cadence instead of being lost
+    /// while the backend blocks.
+    pub fn frame_pending(&self) -> bool {
+        self.render_pending
     }
 
     /// Handle a pointer event from any backend (preview WebSocket, touch device).
@@ -326,6 +378,10 @@ impl FrameSource for TouchbardSystem {
 
     fn needs_redraw(&self) -> bool {
         self.needs_redraw()
+    }
+
+    fn frame_pending(&self) -> bool {
+        self.frame_pending()
     }
 }
 
@@ -568,8 +624,24 @@ mod tests {
             "hover change must wake the host"
         );
 
-        // The requested redraw produces one frame, then the UI is idle again.
-        assert!(sys.frame(Some(waker)).is_some(), "requested redraw renders");
+        // The requested redraw is coalesced to the presentation cadence: if it
+        // arrives within one cadence of the initial present it is deferred and
+        // reported pending, then presented on the backend's next bounded wait;
+        // if it arrives after the cadence boundary it is presented immediately.
+        // Either way at most one frame comes out of the request, then the UI
+        // idles again.
+        let deferred = sys.frame(Some(waker)).is_none();
+        if deferred {
+            assert!(
+                sys.frame_pending(),
+                "deferred redraw must be reported pending"
+            );
+            std::thread::sleep(touchbard_renderer::frame_source::FRAME_CADENCE * 2);
+            assert!(
+                sys.frame(Some(waker)).is_some(),
+                "pending redraw presents after the cadence"
+            );
+        }
         assert!(
             sys.frame(Some(waker)).is_none(),
             "redraw consumed; idle again"

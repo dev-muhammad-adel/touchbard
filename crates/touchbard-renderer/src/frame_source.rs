@@ -4,6 +4,14 @@ use std::task::Waker;
 
 use crate::{Frame, PointerEvent};
 
+/// The presentation cadence: change-driven frames are coalesced to at most one
+/// per period (≈60 Hz on a 60 Hz touch bar). A burst of scheduler wakeups — for
+/// example a high-frequency timer updating state — must not each force their
+/// own rasterize; the newest state is presented instead, at most one period
+/// late. This is the same bound a backend already applies while a document is
+/// animating; here it is the general upper bound shared by every backend.
+pub const FRAME_CADENCE: std::time::Duration = std::time::Duration::from_millis(16);
+
 /// A viewport-agnostic runtime shell that produces frames and accepts pointer
 /// input.
 ///
@@ -24,10 +32,14 @@ use crate::{Frame, PointerEvent};
 /// changed. The runtime answers `Some` only when the document changed, a
 /// redraw was requested (shell provider / hover), or the document is animating;
 /// otherwise it answers `None` and the backend keeps blocking, so nothing is
-/// presented and no frames are rasterized while a UI is idle. A backend that
-/// arms its host waker is guaranteed at least one `Some` answer, its initial
-/// present, even if the runtime already pre-rendered a frame with no waker
-/// armed; after that, presentation is strictly change-driven.
+/// presented and no frames are rasterized while a UI is idle. Among change
+/// events, presentation is coalesced to at most one frame per
+/// [`FRAME_CADENCE`]: a burst of scheduler wakeups (e.g. a high-frequency timer
+/// updating state) is deferred through [`frame_pending`](FrameSource::frame_pending)
+/// and presented at the cadence, never per wake. A backend that arms its host
+/// waker is guaranteed at least one `Some` answer, its initial present, even if
+/// the runtime already pre-rendered a frame with no waker armed; after that,
+/// presentation is change-driven within the cadence.
 pub trait FrameSource {
     /// Dispatch a pointer event given in logical (CSS) pixels.
     fn handle_pointer_event(&mut self, event: PointerEvent);
@@ -52,4 +64,17 @@ pub trait FrameSource {
     /// document is animating (CSS animations/transitions, `<canvas>`). A
     /// backend uses this to bound its wait while such ticks are active.
     fn needs_redraw(&self) -> bool;
+
+    /// Whether a frame is due that was coalesced into the presentation cadence.
+    ///
+    /// [`frame`](FrameSource::frame) coalesces change-driven renders to at most
+    /// one per [`FRAME_CADENCE`], rather than every scheduler wake: when a burst
+    /// of changes (e.g. a high-frequency timer) arrives sooner than the cadence,
+    /// the render is deferred and `frame_pending()` becomes true for the next
+    /// wait. A backend must bound its wait for it exactly as it does for
+    /// [`needs_redraw`](Self::needs_redraw), so the deferred frame is presented
+    /// within one cadence instead of being lost while the backend blocks.
+    fn frame_pending(&self) -> bool {
+        false
+    }
 }

@@ -16,14 +16,14 @@
 //! current-thread Tokio runtime + `LocalSet`.
 //!
 //! Known limitation with multiple connections: every connection drives the one
-//! shared runtime, which holds a single host waker — the last connection to
-//! arm it wins. Incoming events on one tab while another has the waker armed
-//! can wake the wrong connection, delaying that frame until the next wake it
-//! does receive (a keepalive tick, the 16 ms animation tick while animating,
-//! or its own input). The initial-present guarantee holds for the first
-//! connection. Single-tab use is the supported scenario, so the server accepts
-//! exactly one live preview client and rejects a second connection gracefully
-//! (WebSocket policy-close) instead of sharing the runtime between them.
+//! shared runtime, which holds a single host waker — only the connection that
+//! most recently armed it is fed. Incoming events on one tab while another has
+//! the waker armed can wake the wrong connection, so the server supports a
+//! single live preview client at a time. Rather than rejecting the newcomer,
+//! the policy is **last-wins**: a new connection immediately seizes the shared
+//! slot and politely closes the previous one, so a stale tab from an earlier
+//! run is evicted instead of spinning forever in a
+//! "disconnected — reconnecting…" loop.
 
 use crate::protocol::{self, Hello};
 use touchbard_renderer::{
@@ -46,19 +46,42 @@ use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::WebSocketStream;
 use tracing::{info, warn};
 
-/// RAII guard that decrements the active-client count when a connection drops.
-struct ActiveClientGuard(Rc<Cell<usize>>);
+/// Shared single-client state: whichever connection currently holds the slot is
+/// the one driving the runtime.
+type ClientSlots = Rc<RefCell<Option<Rc<ClientKick>>>>;
+
+/// A per-connection "kick" handle. The runtime arms a single host waker, so a
+/// second live connection is not supported; when a new connection arrives it
+/// seizes the slot and closes the previous one instead of being rejected.
+struct ClientKick {
+    closed: Cell<bool>,
+    notify: Notify,
+}
+
+/// RAII guard that frees the active-client slot when a connection drops — but
+/// only if the slot still points at this connection, so the connection evicted
+/// by a replacement does not clear the new owner.
+struct ActiveClientGuard {
+    slots: ClientSlots,
+    kick: Rc<ClientKick>,
+}
 
 impl Drop for ActiveClientGuard {
     fn drop(&mut self) {
-        self.0.set(0);
+        let is_owner = matches!(
+            &*self.slots.borrow(),
+            Some(current) if Rc::ptr_eq(current, &self.kick)
+        );
+        if is_owner {
+            self.slots.borrow_mut().take();
+        }
     }
 }
 
 /// Upper bound on the animation cadence (≈60 Hz): while the runtime reports it
 /// is animating, the connection loop asks for a frame every [`ANIM_TICK`]. Not
 /// a fixed render rate — an idle document blocks on the WebSocket/wake select.
-const ANIM_TICK: Duration = Duration::from_millis(16);
+const ANIM_TICK: Duration = touchbard_renderer::frame_source::FRAME_CADENCE;
 
 /// The [`Wake`] that completes a connection's [`Notify`]: Dioxus scheduler
 /// wakeups and shell redraw requests unblock the connection's select loop so
@@ -268,15 +291,15 @@ async fn serve(
     info!("Preview server listening on http://{}", config.bind_addr);
 
     // Single-client server: at most one live preview connection at a time (see
-    // module docs). Later connections are rejected with a policy close.
-    let active_clients = Rc::new(Cell::new(0usize));
+    // module docs). A new connection seizes the slot and kicks the previous one.
+    let slots: ClientSlots = Rc::default();
 
     loop {
         let (stream, addr) = listener.accept().await?;
         let source = Rc::clone(&source);
-        let active_clients = Rc::clone(&active_clients);
+        let slots = Rc::clone(&slots);
         tokio::task::spawn_local(async move {
-            if let Err(e) = handle_connection(stream, viewport, source, active_clients).await {
+            if let Err(e) = handle_connection(stream, viewport, source, slots).await {
                 warn!("Connection {addr} error: {e}");
             }
         });
@@ -380,7 +403,7 @@ async fn handle_connection(
     mut stream: TcpStream,
     viewport: Viewport,
     source: Rc<RefCell<dyn FrameSource>>,
-    active_clients: Rc<Cell<usize>>,
+    slots: ClientSlots,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     stream.set_nodelay(true).ok();
 
@@ -450,21 +473,25 @@ async fn handle_connection(
 
     info!("WebSocket connection established");
 
-    // Single-client policy: the shared runtime holds exactly one host waker;
-    // a second live connection would steal wakes from the first. Reject extras
-    // with a clean protocol-close instead of sharing the runtime.
-    if active_clients.get() > 0 {
-        info!("Rejecting duplicate preview client (single-client server)");
-        let _ = ws
-            .send(Message::Close(Some(CloseFrame {
-                code: tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode::Policy,
-                reason: "only one preview client is supported".into(),
-            })))
-            .await;
-        return Ok(());
+    // Last-wins single-client policy: the runtime arms exactly one host waker,
+    // so a second live connection would steal wakes from the current one.
+    // Instead of rejecting the newcomer, it seizes the slot and politely closes
+    // the previous connection (a stale tab from an earlier run is evicted
+    // rather than left retrying forever).
+    let kick = Rc::new(ClientKick {
+        closed: Cell::new(false),
+        notify: Notify::new(),
+    });
+    let previous = slots.borrow_mut().replace(Rc::clone(&kick));
+    if let Some(previous) = previous {
+        info!("Replacing previous preview client (last-wins)");
+        previous.closed.set(true);
+        previous.notify.notify_one();
     }
-    active_clients.set(1);
-    let _active_guard = ActiveClientGuard(active_clients);
+    let _active_guard = ActiveClientGuard {
+        slots: Rc::clone(&slots),
+        kick: Rc::clone(&kick),
+    };
 
     // Host wake bridge: the runtime registers this waker on the Dioxus
     // scheduler and the shell redraw bridge; either unblocks the select below
@@ -504,9 +531,24 @@ async fn handle_connection(
     let mut close = false;
     let mut last_ping = std::time::Instant::now();
     while !close {
+        // A newer connection seized the slot: close this one gracefully and
+        // let the replacement drive the runtime.
+        if kick.closed.get() {
+            info!("Kicking preview client replaced by a newer connection");
+            let _ = ws
+                .send(Message::Close(Some(CloseFrame {
+                    code: tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode::Normal,
+                    reason: "replaced by a newer preview client".into(),
+                })))
+                .await;
+            break;
+        }
+
         // The animation-tick branch is armed only while the document is
-        // animating; otherwise the connection blocks on input/wake/keepalive.
+        // animating (or a frame is coalesced pending); otherwise the connection
+        // blocks on input/wake/keepalive.
         let animating = source.borrow().needs_redraw();
+        let pending = source.borrow().frame_pending();
 
         let wait_start = std::time::Instant::now();
         tokio::select! {
@@ -564,7 +606,8 @@ async fn handle_connection(
                 }
             }
             _ = frame_wake.notify.notified() => {}
-            _ = tokio::time::sleep(ANIM_TICK), if animating => {}
+            _ = kick.notify.notified() => {}
+            _ = tokio::time::sleep(ANIM_TICK), if animating || pending => {}
         }
 
         // Keepalive/RTT probe: the sleep-arm version above never fires while
@@ -786,10 +829,10 @@ mod ws_integration_tests {
 
             let server_source = Rc::clone(&source);
             let server_viewport = viewport;
-            let active_clients = Rc::new(Cell::new(0usize));
+            let slots: ClientSlots = Rc::default();
             local.spawn_local(async move {
                 let (stream, _) = listener.accept().await.expect("accept");
-                handle_connection(stream, server_viewport, server_source, active_clients)
+                handle_connection(stream, server_viewport, server_source, slots)
                     .await
                     .expect("connection handled");
             });
@@ -831,13 +874,14 @@ mod ws_integration_tests {
         });
     }
 
-    /// The server supports exactly one live preview client: a second connection
-    /// must be rejected with a clean policy close (not a panic). Regression for
-    /// the duplicate-connection crash caused by holding a `RefCell` borrow
-    /// across `ws.send(...).await` while a second connection borrowed the same
-    /// shell.
+    /// The server supports exactly one live preview client. Last-wins: when a
+    /// second connection arrives it seizes the slot and kicks the previous one
+    /// (which is closed by the server) instead of rejecting the newcomer.
+    /// Regression for the duplicate-connection crash caused by holding a
+    /// `RefCell` borrow across `ws.send(...).await` while a second connection
+    /// borrowed the same shell.
     #[test]
-    fn duplicate_connection_is_rejected_with_policy_close() {
+    fn new_preview_client_kicks_the_previous_one() {
         let viewport = Viewport {
             width: 160,
             height: 60,
@@ -860,14 +904,14 @@ mod ws_integration_tests {
 
             let server_source = Rc::clone(&source);
             let server_viewport = viewport;
-            let active_clients = Rc::new(Cell::new(0usize));
+            let slots: ClientSlots = Rc::default();
             local.spawn_local(async move {
                 for _ in 0..2 {
                     let (stream, _) = listener.accept().await.expect("accept");
                     let source = Rc::clone(&server_source);
-                    let active = Rc::clone(&active_clients);
+                    let slots = Rc::clone(&slots);
                     tokio::task::spawn_local(async move {
-                        let _ = handle_connection(stream, server_viewport, source, active).await;
+                        let _ = handle_connection(stream, server_viewport, source, slots).await;
                     });
                 }
             });
@@ -884,43 +928,42 @@ mod ws_integration_tests {
                 .await
                 .expect("second websocket upgrade");
 
-            // The second connection must receive the policy close (and the
-            // first must keep streaming frames, i.e. the guard freed the shell
-            // for the first client).
-            let deadline = tokio::time::sleep(Duration::from_millis(500));
+            // The second (newest) connection wins the slot: it must keep
+            // receiving frames.
+            let mut frames = 0u32;
+            let deadline = tokio::time::sleep(Duration::from_millis(800));
             tokio::pin!(deadline);
             loop {
                 tokio::select! {
                     msg = second.next() => match msg {
-                        Some(Ok(Message::Close(_frame))) => break,
-                        Some(Ok(Message::Binary(bytes))) if bytes.first() == Some(&(MsgType::Frame as u8)) => continue,
-                        Some(Ok(_)) => {}
-                        Some(Err(e)) => panic!("second ws unexpected error: {e}"),
-                        None => panic!("second ws closed without a policy frame"),
-                    },
-                    _ = &mut deadline => panic!("second connection was not rejected"),
-                }
-            }
-
-            // The first connection must still be usable (frames flowing).
-            let mut frames = 0u32;
-            let deadline = tokio::time::sleep(Duration::from_millis(500));
-            tokio::pin!(deadline);
-            loop {
-                tokio::select! {
-                    msg = first.next() => match msg {
                         Some(Ok(Message::Binary(bytes))) if bytes.first() == Some(&(MsgType::Frame as u8)) => {
                             frames += 1;
                             if frames >= 2 { break; }
                         }
                         Some(Ok(_)) => {}
-                        Some(Err(e)) => panic!("first ws error: {e}"),
-                        None => panic!("first ws closed unexpectedly"),
+                        Some(Err(e)) => panic!("second ws error: {e}"),
+                        None => panic!("second (winner) ws closed unexpectedly"),
                     },
-                    _ = &mut deadline => break,
+                    _ = &mut deadline => panic!("second client never received frames"),
                 }
             }
-            assert!(frames >= 2, "first client must keep receiving frames; got {frames}");
+            assert!(frames >= 2, "newest client must stream frames; got {frames}");
+
+            // The first connection must have been kicked: the server closes it
+            // instead of the newcomer trying (and failing) to borrow the shell.
+            let deadline = tokio::time::sleep(Duration::from_millis(800));
+            tokio::pin!(deadline);
+            loop {
+                tokio::select! {
+                    msg = first.next() => match msg {
+                        None => break,
+                        Some(Ok(Message::Close(_))) => break,
+                        Some(Ok(_)) => {}
+                        Some(Err(e)) => panic!("kicked client error: {e}"),
+                    },
+                    _ = &mut deadline => panic!("previous client was not kicked"),
+                }
+            }
         });
     }
 }

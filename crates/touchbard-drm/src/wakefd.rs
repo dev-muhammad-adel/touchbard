@@ -12,7 +12,7 @@ use std::task::{RawWaker, RawWakerVTable, Waker};
 
 /// How long the DRM loop waits while the document is animating (≈60 Hz). Once
 /// animation stops, [`WakeFd::wait`] blocks indefinitely again.
-pub(crate) const ANIM_TICK: std::time::Duration = std::time::Duration::from_millis(16);
+pub(crate) const ANIM_TICK: std::time::Duration = touchbard_renderer::frame_source::FRAME_CADENCE;
 
 /// An `eventfd` host wake and runtime waker.
 ///
