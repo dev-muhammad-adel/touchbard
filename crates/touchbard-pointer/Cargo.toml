@@ -1,0 +1,9 @@
+[package]
+name = "touchbard-pointer"
+version = "0.1.0"
+edition = "2021"
+description = "Pointer (mouse / trackpad) motion reading for Touchbard"
+
+[dependencies]
+libc = "0.2"
+tracing = { workspace = true }

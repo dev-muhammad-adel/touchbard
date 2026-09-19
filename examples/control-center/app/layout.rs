@@ -14,6 +14,9 @@ pub fn Layout(children: Element) -> Element {
     // physical key readout (`kbd: <key> / <gesture>`) via keyboard.rs.
     // let keyboard_event = crate::keyboard::use_key_events();
     let route = use_route();
+    // Pointer activity readout: `moving` while the mouse / trackpad moves,
+    // `idle` after 400 ms of stillness.
+    let pointer_moving = crate::pointer::use_pointer_moving();
     // let keyboard_status = keyboard_event()
     //     .map(|event| format!("{:?} / {:?}", event.key, event.gesture))
     //     .unwrap_or_else(|| "waiting".to_string());
@@ -26,11 +29,12 @@ pub fn Layout(children: Element) -> Element {
             div {
                 style: "position: relative; width: 100%; height: 100%; background: #1a1b26; color: #c0caf5; font-family: system-ui, sans-serif;",
                 {children}
+     
                 // Keyboard readout hidden (see header comment).
-                // span {
-                //     style: "position: absolute; right: 4px; bottom: 2px; color: #565f89; font-size: 9px;",
-                //     "kbd: {keyboard_status}"
-                // }
+                span {
+                    style: "position: absolute; right: 4px; bottom: 2px; color: #565f89; font-size: 18px;",
+                    "mouse: {pointer_moving}"
+                }
             }
         };
     }
@@ -79,6 +83,10 @@ pub fn Layout(children: Element) -> Element {
                 //     style: "margin-left: 6px; color: #565f89; font-size: 9px; white-space: nowrap;",
                 //     "kbd: {keyboard_status}"
                 // }
+                span {
+                    style: "margin-left: 6px; color: #565f89; font-size: 9px; white-space: nowrap;",
+                    if pointer_moving() { "ptr: moving" } else { "ptr: idle" }
+                }
             }
 
             // Page content.

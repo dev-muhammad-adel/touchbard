@@ -32,7 +32,11 @@ use touchbard::{Backend, TouchbardConfig};
 use touchbard_drm::{DrmBackend, DrmConfig};
 use touchbard_preview::PreviewBackend;
 
+#[path = "hooks/use_key_events.rs"]
 mod keyboard;
+
+#[path = "hooks/use_pointer_moving.rs"]
+mod pointer;
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
